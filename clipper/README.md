@@ -37,6 +37,9 @@ python clipper.py my_podcast.mp4
 
 # Make 3 clips and upload them as private
 python clipper.py my_podcast.mp4 --count 3 --upload --credit "Clipped from @creator with permission"
+
+# Upload clips you already made (asks y/n/edit-title for each one)
+python clipper.py --upload-existing "output/my_podcast.clips.json" --privacy public
 ```
 
 Options: `--count` (max clips), `--whisper tiny|base|small|medium` (bigger is more accurate, slower), `--privacy private|unlisted|public`.

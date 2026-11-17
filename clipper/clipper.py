@@ -272,16 +272,55 @@ def upload(yt, path: Path, clip: Clip, privacy: str, credit: str) -> str:
     return f"https://youtube.com/shorts/{response['id']}"
 
 
+def upload_existing(manifest: Path, privacy: str, credit: str) -> None:
+    """Upload clips the bot already made, asking about each one first."""
+    if not manifest.exists():
+        sys.exit(f"Not found: {manifest}\nLook in the output folder for a file ending in .clips.json")
+    entries = json.loads(manifest.read_text())
+    pending = [e for e in entries if not e.get("url")]
+    if not pending:
+        sys.exit("Every clip in this list is already uploaded.")
+
+    print(f"{len(pending)} clips not uploaded yet. For each one: y = upload, n = skip, e = edit title.\n")
+    yt = youtube_client()
+    for entry in pending:
+        path = Path(entry["file"])
+        if not path.exists():
+            print(f"Skipping, file missing: {path.name}")
+            continue
+        print(f"{entry['score']}/10  {entry['title']}\n    {path.name}")
+        answer = input("    Upload? [y/n/e] ").strip().lower()
+        if answer == "e":
+            entry["title"] = input("    New title: ").strip() or entry["title"]
+            answer = "y"
+        if answer != "y":
+            print("    skipped\n")
+            continue
+        clip = Clip(**{k: entry[k] for k in Clip.model_fields})
+        entry["url"] = upload(yt, path, clip, privacy, credit)
+        manifest.write_text(json.dumps(entries, indent=2))  # save after each so a crash loses nothing
+        print(f"    uploaded ({privacy}): {entry['url']}\n")
+    print("Done.")
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 def main() -> None:
     p = argparse.ArgumentParser(description="Turn a long video into YouTube Shorts.")
-    p.add_argument("source", help="Video file path or URL")
+    p.add_argument("source", nargs="?", help="Video file path or URL")
+    p.add_argument("--upload-existing", metavar="CLIPS_JSON",
+                   help="Upload clips already made, from an output/*.clips.json file")
     p.add_argument("--count", type=int, default=5, help="Max clips to make (default 5)")
     p.add_argument("--whisper", default="small", help="Whisper model: tiny, base, small, medium")
     p.add_argument("--upload", action="store_true", help="Upload clips to YouTube")
     p.add_argument("--privacy", default="private", choices=["private", "unlisted", "public"])
     p.add_argument("--credit", default="", help='Credit line, e.g. "Clipped from @creator with permission"')
     args = p.parse_args()
+
+    if args.upload_existing:
+        upload_existing(Path(args.upload_existing).expanduser(), args.privacy, args.credit)
+        return
+    if not args.source:
+        p.error("give a video file or URL, or use --upload-existing")
 
     video = fetch(args.source)
     words = transcribe(video, args.whisper)
