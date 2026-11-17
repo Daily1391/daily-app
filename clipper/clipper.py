@@ -173,6 +173,36 @@ Format: Layer, Start, End, Style, Text
     path.write_text(header + "\n".join(events) + "\n")
 
 
+_FFMPEG: tuple[str, bool] | None = None
+
+
+def find_ffmpeg() -> tuple[str, bool]:
+    """Pick an ffmpeg that can burn captions. Homebrew's plain 'ffmpeg' can't
+    (no libass); 'ffmpeg-full' can. Falls back to no captions with a warning."""
+    global _FFMPEG
+    if _FFMPEG:
+        return _FFMPEG
+    candidates = [
+        "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+        "/usr/local/opt/ffmpeg-full/bin/ffmpeg",
+        "ffmpeg",
+    ]
+    for exe in candidates:
+        try:
+            filters = subprocess.run(
+                [exe, "-hide_banner", "-filters"], capture_output=True, text=True
+            ).stdout
+        except FileNotFoundError:
+            continue
+        if re.search(r"\ssubtitles\s", filters):
+            _FFMPEG = (exe, True)
+            return _FFMPEG
+    print("Warning: your ffmpeg can't add captions. Clips will have none.\n"
+          "  Fix: brew install ffmpeg-full")
+    _FFMPEG = ("ffmpeg", False)
+    return _FFMPEG
+
+
 def render(video: Path, words: list[dict], clip: Clip, index: int) -> Path:
     """Cut the clip and make it 1080x1920: sharp video centered over a blurred fill."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -181,15 +211,16 @@ def render(video: Path, words: list[dict], clip: Clip, index: int) -> Path:
     subs = OUT_DIR / f"{index:02d}.ass"
     write_captions(words, clip, subs)
 
+    ffmpeg, has_subs = find_ffmpeg()
+    captions = f",subtitles='{subs.as_posix()}'" if has_subs else ""
     vf = (
         "[0:v]split[a][b];"
         "[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:2[bg];"
         "[b]scale=1080:-2[fg];"
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
-        f"subtitles='{subs.as_posix()}'[v]"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2{captions}[v]"
     )
     cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
+        ffmpeg, "-y", "-loglevel", "error",
         "-ss", f"{clip.start:.2f}", "-to", f"{clip.end:.2f}", "-i", str(video),
         "-filter_complex", vf, "-map", "[v]", "-map", "0:a?",
         "-c:v", "libx264", "-preset", "medium", "-crf", "20",
