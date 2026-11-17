@@ -8,6 +8,12 @@ Turns a long video into vertical YouTube Shorts.
 4. Cuts each moment to 1080x1920 with a blurred background and big captions.
 5. Uploads to YouTube as **private** so you check each one before it goes public.
 
+## Easiest way: the app
+
+Double-click `Clipper.command`. A browser page opens where you drop in a video, make clips, watch them, edit titles, and pick which to upload. The first run installs everything (a few minutes). Keep the black window open while you use it; close it to stop.
+
+If macOS blocks it the first time: right-click `Clipper.command`, choose Open, then Open again.
+
 ## Setup (once)
 
 You need Python 3.10+ and ffmpeg (`brew install ffmpeg` on Mac).

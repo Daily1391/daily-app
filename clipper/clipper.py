@@ -31,7 +31,7 @@ def fetch(source: str) -> Path:
     if not re.match(r"^https?://", source):
         path = Path(source).expanduser().resolve()
         if not path.exists():
-            sys.exit(f"File not found: {path}")
+            raise ClipperError(f"File not found: {path}")
         return path
 
     import yt_dlp
@@ -127,7 +127,7 @@ def pick_clips(words: list[dict], count: int) -> list[Clip]:
         output_format=ClipPlan,
     )
     if response.stop_reason == "refusal" or response.parsed_output is None:
-        sys.exit(f"Claude did not return clips (stop_reason={response.stop_reason}).")
+        raise ClipperError(f"Claude did not return clips (stop_reason={response.stop_reason}).")
 
     clips, taken = [], []
     for c in sorted(response.parsed_output.clips, key=lambda c: -c.score):
@@ -203,12 +203,13 @@ def find_ffmpeg() -> tuple[str, bool]:
     return _FFMPEG
 
 
-def render(video: Path, words: list[dict], clip: Clip, index: int) -> Path:
+def render(video: Path, words: list[dict], clip: Clip, index: int, prefix: str = "") -> Path:
     """Cut the clip and make it 1080x1920: sharp video centered over a blurred fill."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     slug = re.sub(r"[^a-z0-9]+", "-", clip.title.lower()).strip("-")[:40] or "clip"
-    out = OUT_DIR / f"{index:02d}-{slug}.mp4"
-    subs = OUT_DIR / f"{index:02d}.ass"
+    tag = f"{prefix}-" if prefix else ""
+    out = OUT_DIR / f"{tag}{index:02d}-{slug}.mp4"
+    subs = OUT_DIR / f"{tag}{index:02d}.ass"
     write_captions(words, clip, subs)
 
     ffmpeg, has_subs = find_ffmpeg()
@@ -249,7 +250,7 @@ def youtube_client():
             creds.refresh(Request())
         else:
             if not secret.exists():
-                sys.exit("Missing client_secret.json. See README, step 'YouTube setup'.")
+                raise ClipperError("Missing client_secret.json. See README, step 'YouTube setup'.")
             creds = InstalledAppFlow.from_client_secrets_file(secret, SCOPES).run_local_server(port=0)
         token.write_text(creds.to_json())
     return build("youtube", "v3", credentials=creds)
@@ -270,6 +271,35 @@ def upload(yt, path: Path, clip: Clip, privacy: str, credit: str) -> str:
     while response is None:
         _, response = request.next_chunk()
     return f"https://youtube.com/shorts/{response['id']}"
+
+
+class ClipperError(Exception):
+    pass
+
+
+def make_clips(source: str, count: int, whisper: str, log=print) -> Path:
+    """Fetch, transcribe, pick and render. Returns the path of the clips list."""
+    log("Getting the video...")
+    video = fetch(source)
+    log("Transcribing (the slow part)...")
+    words = transcribe(video, whisper)
+    if not words:
+        raise ClipperError("No speech found. This bot picks clips from what people say.")
+    log("Asking Claude for the best moments...")
+    clips = pick_clips(words, count)
+    if not clips:
+        raise ClipperError("Claude found no clips worth posting in this video.")
+
+    stem = re.sub(r"[^A-Za-z0-9]+", "-", video.stem).strip("-")[:40] or "video"
+    results = []
+    for i, clip in enumerate(clips, 1):
+        log(f"Cutting clip {i} of {len(clips)}: {clip.title}")
+        path = render(video, words, clip, i, prefix=stem)
+        results.append({**clip.model_dump(), "file": str(path)})
+
+    manifest = OUT_DIR / f"{stem}.clips.json"
+    manifest.write_text(json.dumps(results, indent=2))
+    return manifest
 
 
 def upload_existing(manifest: Path, privacy: str, credit: str) -> None:
@@ -322,29 +352,19 @@ def main() -> None:
     if not args.source:
         p.error("give a video file or URL, or use --upload-existing")
 
-    video = fetch(args.source)
-    words = transcribe(video, args.whisper)
-    if not words:
-        sys.exit("No speech found. This bot picks clips from what people say.")
-
-    clips = pick_clips(words, args.count)
-    if not clips:
-        sys.exit("Claude found no clips worth posting in this video.")
-
-    yt = youtube_client() if args.upload else None
-    results = []
-    for i, clip in enumerate(clips, 1):
-        print(f"[{i}/{len(clips)}] {clip.score}/10  {clip.start:.0f}s-{clip.end:.0f}s  {clip.title}")
-        path = render(video, words, clip, i)
-        entry = {**clip.model_dump(), "file": str(path)}
-        if yt:
-            entry["url"] = upload(yt, path, clip, args.privacy, args.credit)
+    try:
+        manifest = make_clips(args.source, args.count, args.whisper)
+    except ClipperError as e:
+        sys.exit(str(e))
+    entries = json.loads(manifest.read_text())
+    if args.upload:
+        yt = youtube_client()
+        for entry in entries:
+            clip = Clip(**{k: entry[k] for k in Clip.model_fields})
+            entry["url"] = upload(yt, Path(entry["file"]), clip, args.privacy, args.credit)
+            manifest.write_text(json.dumps(entries, indent=2))
             print(f"    uploaded ({args.privacy}): {entry['url']}")
-        results.append(entry)
-
-    manifest = OUT_DIR / f"{video.stem}.clips.json"
-    manifest.write_text(json.dumps(results, indent=2))
-    print(f"\nDone. {len(results)} clips in {OUT_DIR}. Details: {manifest}")
+    print(f"\nDone. {len(entries)} clips in {OUT_DIR}. Details: {manifest}")
 
 
 if __name__ == "__main__":

@@ -5,3 +5,4 @@ av<19  # av 19 breaks faster-whisper audio decoding
 yt-dlp
 google-api-python-client
 google-auth-oauthlib
+streamlit
