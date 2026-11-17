@@ -10,5 +10,10 @@ if [ ! -x .venv/bin/python ]; then
 fi
 .venv/bin/pip install -q -r requirements.txt || { echo "Install failed. Send a screenshot."; read -r; exit 1; }
 
+# Skip Streamlit's one-time "enter your email" prompt
+if [ ! -f "$HOME/.streamlit/credentials.toml" ]; then
+  mkdir -p "$HOME/.streamlit" && printf '[general]\nemail = ""\n' > "$HOME/.streamlit/credentials.toml"
+fi
+
 echo "Clipper is running. Your browser will open. Close this window to stop it."
 exec .venv/bin/python -m streamlit run app.py
