@@ -92,6 +92,7 @@ with make_tab:
                      index=style_names.index(settings.get("style", "full")))
     watermark = c4.text_input("Watermark (your channel name)", settings.get("watermark", ""),
                               disabled=style != "full", help="Small text under the captions")
+    cut_pauses = st.checkbox("Cut out pauses (keeps people watching)", value=settings.get("cut_pauses", True))
 
     if st.button("Make clips", type="primary", disabled=not key):
         if not uploaded and not link.strip():
@@ -110,10 +111,10 @@ with make_tab:
 
             with st.status("Working… a long video can take 10 to 20 minutes.", expanded=True) as status:
                 try:
-                    save_settings(style=style, watermark=watermark)
+                    save_settings(style=style, watermark=watermark, cut_pauses=cut_pauses)
                     manifest = clipper.make_clips(
                         source, count, "base" if speed == "Fast" else "small", log=st.write,
-                        style=style, watermark=watermark,
+                        style=style, watermark=watermark, cut_pauses=cut_pauses,
                     )
                 except Exception as e:  # show any failure in the page, not a crash
                     status.update(label="Something went wrong", state="error")
@@ -172,7 +173,8 @@ with clips_tab:
                                     tmp = path.with_name(path.stem + ".new.mp4")  # keep the old clip if this fails
                                     clipper.render(source, words, clipper.clip_from_entry(entry), i + 1, out=tmp,
                                                    style=entry.get("style", "blur"),
-                                                   watermark=entry.get("watermark", ""))
+                                                   watermark=entry.get("watermark", ""),
+                                                   cut_pauses=entry.get("cut_pauses", False))
                                     tmp.replace(path)
                                     manifest.write_text(json.dumps(entries, indent=2))
                                 st.rerun()

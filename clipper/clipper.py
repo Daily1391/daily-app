@@ -22,6 +22,8 @@ from pydantic import BaseModel, Field
 
 OUT_DIR = Path(__file__).parent / "output"
 MIN_LEN, MAX_LEN = 15.0, 59.0  # Shorts must be under 60s to be safe everywhere
+TARGET = "20 to 40"  # seconds; shorter clips get watched to the end more often
+GAP = 0.35  # pauses longer than this get cut out
 MODEL = "claude-opus-5-5"
 
 
@@ -104,12 +106,20 @@ class ClipPlan(BaseModel):
 SYSTEM = """You are a short-form video editor who finds the moments in long videos \
 that perform as YouTube Shorts.
 
+Your only goal is retention: viewers who don't swipe away, watch to the end, and replay.
+
 A good clip:
-- Opens on a hook in the first two seconds: a bold claim, a question, a surprise, \
-conflict, or a strong emotion. Never opens on filler like "so", "um", or "anyway".
+- Wins the first second. The very first words are the hook: a bold claim, a question, \
+a surprise, conflict, or a strong emotion. Start in the middle of the action, not on \
+the setup. Never open on filler like "so", "um", "anyway" or "okay so".
 - Stands alone. A viewer with zero context understands it.
 - Has a payoff: a punchline, a reveal, a useful insight, or a strong opinion.
+- Ends the moment the payoff lands. No wind-down, no "anyway", no laughing it off. \
+A hard stop on the best line makes people replay it.
+- Is as short as it can be while still landing. Aim for 20 to 40 seconds.
 - Starts and ends on sentence boundaries so it doesn't cut mid-word.
+Score each clip on how likely a stranger is to watch it to the end, not on how \
+interesting it is to a fan.
 
 For each clip also write overlay: the fixed text shown on screen for the whole clip, \
 the thing that stops a scroller. 3 to 8 words. Build curiosity without spoiling the \
@@ -128,7 +138,8 @@ Rank clips best first. Skip weak moments rather than padding the list."""
 def pick_clips(words: list[dict], count: int) -> list[Clip]:
     client = anthropic.Anthropic()
     prompt = (
-        f"Find up to {count} clips between {MIN_LEN:.0f} and {MAX_LEN:.0f} seconds long "
+        f"Find up to {count} clips, ideally {TARGET} seconds and never under {MIN_LEN:.0f} "
+        f"or over {MAX_LEN:.0f} seconds, "
         f"in this transcript.\n\n<transcript>\n{transcript_lines(words)}\n</transcript>"
     )
     print("Asking Claude for the best moments...")
@@ -304,8 +315,50 @@ def zoom_expr(words: list[dict], clip: Clip) -> str:
     return z
 
 
+def speech_segments(words: list[dict], clip: Clip, gap: float = GAP, pad: float = 0.08):
+    """Stretches of talking inside the clip, in clip time, with pauses removed."""
+    inside = [w for w in words if w["start"] >= clip.start and w["end"] <= clip.end]
+    segs: list[list[float]] = []
+    for w in inside:
+        a = max(w["start"] - clip.start - pad, 0)
+        b = min(w["end"] - clip.start + pad, clip.end - clip.start)
+        if segs and a - segs[-1][1] <= gap:
+            segs[-1][1] = max(segs[-1][1], b)
+        else:
+            segs.append([a, b])
+    return segs
+
+
+def tighten(words: list[dict], clip: Clip):
+    """Cut the pauses: returns the kept segments plus words and a clip re-timed to match."""
+    segs = speech_segments(words, clip)
+    if not segs:
+        return None, words, clip
+    kept = sum(b - a for a, b in segs)
+    if (clip.end - clip.start) - kept < 0.5:  # almost no dead air, not worth cutting
+        return None, words, clip
+
+    def remap(t: float) -> float:
+        done = 0.0
+        for a, b in segs:
+            if t < a:
+                return done
+            if t <= b:
+                return done + (t - a)
+            done += b - a
+        return done
+
+    new_words = []
+    for w in words:
+        if w["start"] >= clip.start and w["end"] <= clip.end:
+            new_words.append({**w, "start": remap(w["start"] - clip.start),
+                              "end": remap(w["end"] - clip.start)})
+    return segs, new_words, clip.model_copy(update={"start": 0.0, "end": kept})
+
+
 def render(video: Path, words: list[dict], clip: Clip, index: int, prefix: str = "",
-           out: Path | None = None, style: str = "blur", watermark: str = "") -> Path:
+           out: Path | None = None, style: str = "blur", watermark: str = "",
+           cut_pauses: bool = True) -> Path:
     """Cut the clip to 1080x1920. blur: sharp video over a blurred fill.
     full: fill the screen, zoom, punchier colour."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -313,14 +366,30 @@ def render(video: Path, words: list[dict], clip: Clip, index: int, prefix: str =
     tag = f"{prefix}-" if prefix else ""
     out = out or OUT_DIR / f"{tag}{index:02d}-{slug}.mp4"
     subs = out.with_suffix(".ass")
+    source_clip = clip
+    segs = None
+    if cut_pauses:
+        segs, words, clip = tighten(words, clip)  # captions and zooms follow the new timing
     write_captions(words, clip, subs, style=style, watermark=watermark)
+
+    if segs:
+        parts = "".join(
+            f"[0:v]trim={a:.3f}:{b:.3f},setpts=PTS-STARTPTS[v{i}];"
+            f"[0:a]atrim={a:.3f}:{b:.3f},asetpts=PTS-STARTPTS[a{i}];"
+            for i, (a, b) in enumerate(segs)
+        )
+        joined = "".join(f"[v{i}][a{i}]" for i in range(len(segs)))
+        pre = f"{parts}{joined}concat=n={len(segs)}:v=1:a=1[cv][ca];"
+        vin, audio = "[cv]", "[ca]"
+    else:
+        pre, vin, audio = "", "[0:v]", "0:a?"
 
     ffmpeg, has_subs = find_ffmpeg()
     captions = f",subtitles='{subs.as_posix()}'" if has_subs else ""
     if style == "full":
         z = zoom_expr(words, clip)
         vf = (
-            "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+            f"{pre}{vin}scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
             f"scale=w='trunc(1080*({z})/2)*2':h='trunc(1920*({z})/2)*2':eval=frame,"
             "crop=1080:1920,setsar=1,"
             "eq=contrast=1.08:saturation=1.18,unsharp=5:5:0.6"
@@ -328,15 +397,15 @@ def render(video: Path, words: list[dict], clip: Clip, index: int, prefix: str =
         )
     else:
         vf = (
-            "[0:v]split[a][b];"
+            f"{pre}{vin}split[a][b];"
             "[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:2[bg];"
             "[b]scale=1080:-2[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2{captions}[v]"
         )
     cmd = [
         ffmpeg, "-y", "-loglevel", "error",
-        "-ss", f"{clip.start:.2f}", "-to", f"{clip.end:.2f}", "-i", str(video),
-        "-filter_complex", vf, "-map", "[v]", "-map", "0:a?",
+        "-ss", f"{source_clip.start:.2f}", "-to", f"{source_clip.end:.2f}", "-i", str(video),
+        "-filter_complex", vf, "-map", "[v]", "-map", audio,
         "-c:v", "libx264", "-preset", "medium", "-crf", "20",
         "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
         str(out),
@@ -398,7 +467,7 @@ def clip_from_entry(entry: dict) -> Clip:
 
 
 def make_clips(source: str, count: int, whisper: str, log=print,
-               style: str = "full", watermark: str = "") -> Path:
+               style: str = "full", watermark: str = "", cut_pauses: bool = True) -> Path:
     """Fetch, transcribe, pick and render. Returns the path of the clips list."""
     log("Getting the video...")
     video = fetch(source)
@@ -415,9 +484,10 @@ def make_clips(source: str, count: int, whisper: str, log=print,
     results = []
     for i, clip in enumerate(clips, 1):
         log(f"Cutting clip {i} of {len(clips)}: {clip.title}")
-        path = render(video, words, clip, i, prefix=stem, style=style, watermark=watermark)
+        path = render(video, words, clip, i, prefix=stem, style=style, watermark=watermark,
+                      cut_pauses=cut_pauses)
         results.append({**clip.model_dump(), "file": str(path), "source": str(video),
-                        "style": style, "watermark": watermark})
+                        "style": style, "watermark": watermark, "cut_pauses": cut_pauses})
 
     manifest = OUT_DIR / f"{stem}.clips.json"
     manifest.write_text(json.dumps(results, indent=2))
@@ -466,6 +536,7 @@ def main() -> None:
     p.add_argument("--upload", action="store_true", help="Upload clips to YouTube")
     p.add_argument("--privacy", default="private", choices=["private", "unlisted", "public"])
     p.add_argument("--style", default="full", choices=list(STYLES), help="full (zooms, glowing words) or blur")
+    p.add_argument("--keep-pauses", action="store_true", help="Don't cut out pauses")
     p.add_argument("--watermark", default="", help="Small channel name under the captions, full style only")
     p.add_argument("--credit", default="", help='Credit line, e.g. "Clipped from @creator with permission"')
     args = p.parse_args()
@@ -477,7 +548,8 @@ def main() -> None:
         p.error("give a video file or URL, or use --upload-existing")
 
     try:
-        manifest = make_clips(args.source, args.count, args.whisper, style=args.style, watermark=args.watermark)
+        manifest = make_clips(args.source, args.count, args.whisper, style=args.style, watermark=args.watermark,
+                              cut_pauses=not args.keep_pauses)
     except ClipperError as e:
         sys.exit(str(e))
     entries = json.loads(manifest.read_text())
