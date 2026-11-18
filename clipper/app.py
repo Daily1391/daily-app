@@ -86,6 +86,13 @@ with make_tab:
     count = c1.slider("How many clips", 1, 10, 5)
     speed = c2.radio("Transcription", ["Accurate (slower)", "Fast"], horizontal=True)
 
+    c3, c4 = st.columns(2)
+    style_names = list(clipper.STYLES)
+    style = c3.radio("Look", style_names, format_func=clipper.STYLES.get, horizontal=True,
+                     index=style_names.index(settings.get("style", "full")))
+    watermark = c4.text_input("Watermark (your channel name)", settings.get("watermark", ""),
+                              disabled=style != "full", help="Small text under the captions")
+
     if st.button("Make clips", type="primary", disabled=not key):
         if not uploaded and not link.strip():
             st.error("Add a video file or a link first.")
@@ -103,8 +110,10 @@ with make_tab:
 
             with st.status("Working… a long video can take 10 to 20 minutes.", expanded=True) as status:
                 try:
+                    save_settings(style=style, watermark=watermark)
                     manifest = clipper.make_clips(
-                        source, count, "base" if speed == "Fast" else "small", log=st.write
+                        source, count, "base" if speed == "Fast" else "small", log=st.write,
+                        style=style, watermark=watermark,
                     )
                 except Exception as e:  # show any failure in the page, not a crash
                     status.update(label="Something went wrong", state="error")
@@ -161,7 +170,9 @@ with clips_tab:
                                     entry["overlay"] = new_text
                                     words = clipper.transcribe(source, "small")  # cached, so fast
                                     tmp = path.with_name(path.stem + ".new.mp4")  # keep the old clip if this fails
-                                    clipper.render(source, words, clipper.clip_from_entry(entry), i + 1, out=tmp)
+                                    clipper.render(source, words, clipper.clip_from_entry(entry), i + 1, out=tmp,
+                                                   style=entry.get("style", "blur"),
+                                                   watermark=entry.get("watermark", ""))
                                     tmp.replace(path)
                                     manifest.write_text(json.dumps(entries, indent=2))
                                 st.rerun()

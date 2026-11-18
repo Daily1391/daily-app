@@ -92,6 +92,9 @@ class Clip(BaseModel):
     overlay: str = Field(
         description="On-screen hook text shown for the whole clip, 3 to 8 words, no emojis",
     )
+    emphasis: list[str] = Field(
+        description="5 to 12 single words spoken in the clip to highlight in colour in the captions",
+    )
 
 
 class ClipPlan(BaseModel):
@@ -113,6 +116,10 @@ the thing that stops a scroller. 3 to 8 words. Build curiosity without spoiling 
 payoff, for example "JYNXZI REACTS TO A CLIP OF HIMSELF..." or "HE DID NOT EXPECT THIS". \
 Name the creator if the transcript makes clear who it is. It must be true to the clip. \
 No emojis and no hashtags.
+
+Also list emphasis: 5 to 12 single words, spoken inside the clip, that carry the meaning \
+(names, numbers, surprising or emotional words). They light up in colour in the captions. \
+Never pick filler like "the", "and" or "like".
 
 Use only timestamps that appear in the transcript. Clips must not overlap. \
 Rank clips best first. Skip weak moments rather than padding the list."""
@@ -157,8 +164,22 @@ def ass_time(t: float) -> str:
     return f"{int(h)}:{int(m):02d}:{s:05.2f}"
 
 
-def write_captions(words: list[dict], clip: Clip, path: Path, per_line: int = 3) -> None:
-    """Big, centered, 3-words-at-a-time captions, the standard Shorts style."""
+STYLES = {"full": "Full screen with zooms", "blur": "Blurred background"}
+GLOW = ["&H0050FF39&", "&H00FFE500&"]  # green, cyan (ASS colours are BGR)
+
+
+def norm(word: str) -> str:
+    return re.sub(r"[^a-z0-9']", "", word.lower())
+
+
+def esc(text: str) -> str:
+    return text.replace("{", "").replace("}", "").replace("\\", "")
+
+
+def write_captions(words: list[dict], clip: Clip, path: Path, per_line: int = 3,
+                   style: str = "blur", watermark: str = "") -> None:
+    """blur: 3-words-at-a-time captions under the video.
+    full: one big glowing word at a time in the middle, key words in green or cyan."""
     header_tpl = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -168,6 +189,8 @@ PlayResY: 1920
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginV
 Style: Cap,Arial,84,&H00FFFFFF,&H00000000,&H80000000,1,6,2,2,560
 Style: Hook,Arial,{hook_size},&H00FFFFFF,&H00000000,&H80000000,1,7,3,2,{hook_margin}
+Style: Word,Arial,128,&H00FFFFFF,&H00000000,&H90000000,1,5,4,2,980
+Style: Mark,Arial,36,&H60FFFFFF,&H00000000,&HFF000000,0,1,0,8,955
 
 [Events]
 Format: Layer, Start, End, Style, Text
@@ -186,6 +209,34 @@ Format: Layer, Start, End, Style, Text
             parts[split] = "{\\c&H00FFFF00&}" + parts[split]
         text = "\\N".join(parts)
         events.append(f"Dialogue: 1,{ass_time(0)},{ass_time(clip.end - clip.start)},Hook,{text}")
+    hook_margin = "1300" if style == "blur" else "1420"  # full: near the top of the screen
+
+    if style == "full":
+        keys = {norm(k) for phrase in clip.emphasis for k in phrase.split()} - {""}
+        n_key = 0
+        for i, w in enumerate(inside):
+            start = w["start"] - clip.start
+            end = (inside[i + 1]["start"] if i + 1 < len(inside) else w["end"]) - clip.start
+            end = min(end, start + 1.2)  # don't leave a word up through a long pause
+            word = esc(w["text"]).upper().strip()
+            if not word:
+                continue
+            if norm(w["text"]) in keys:
+                colour, n_key = GLOW[n_key % 2], n_key + 1
+                fill, glow_alpha = colour, "&H40&"
+            else:
+                fill, colour, glow_alpha = "&H00FFFFFF&", "&H00FFFFFF&", "&HB0&"
+            pop = "\\fscx80\\fscy80\\t(0,90,\\fscx100\\fscy100)"
+            t0, t1 = ass_time(start), ass_time(end)
+            # layer 2: soft coloured glow behind; layer 3: crisp word on top
+            events.append(f"Dialogue: 2,{t0},{t1},Word,{{{pop}\\1a&HFF&\\3c{colour}\\3a{glow_alpha}\\bord16\\blur14}}{word}")
+            events.append(f"Dialogue: 3,{t0},{t1},Word,{{{pop}\\c{fill}}}{word}")
+        if watermark.strip():
+            events.append(f"Dialogue: 1,{ass_time(0)},{ass_time(clip.end - clip.start)},Mark,{esc(watermark).upper()}")
+        header = header_tpl.replace("{hook_size}", str(hook_size)).replace("{hook_margin}", hook_margin)
+        path.write_text(header + "\n".join(events) + "\n")
+        return
+
     for i in range(0, len(inside), per_line):
         group = inside[i : i + per_line]
         start = group[0]["start"] - clip.start
@@ -193,7 +244,7 @@ Format: Layer, Start, End, Style, Text
         text = " ".join(w["text"] for w in group).upper().replace("{", "").replace("}", "")
         events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Cap,{text}")
     # sits in the blurred band above a 16:9 video (video top is about y=656)
-    header = header_tpl.replace("{hook_size}", str(hook_size)).replace("{hook_margin}", "1300")
+    header = header_tpl.replace("{hook_size}", str(hook_size)).replace("{hook_margin}", hook_margin)
     path.write_text(header + "\n".join(events) + "\n")
 
 
@@ -242,24 +293,46 @@ def find_ffmpeg() -> tuple[str, bool]:
     return _FFMPEG
 
 
+def zoom_expr(words: list[dict], clip: Clip) -> str:
+    """Slow push in and out all the time, plus a quick punch-in on each key word."""
+    keys = {norm(k) for phrase in clip.emphasis for k in phrase.split()} - {""}
+    punches = [w for w in words if clip.start <= w["start"] <= clip.end and norm(w["text"]) in keys][:20]
+    z = "1.06+0.05*sin(2*PI*t/7)"
+    for w in punches:
+        a = w["start"] - clip.start
+        z += f"+0.10*between(t,{a:.2f},{a + 0.45:.2f})"
+    return z
+
+
 def render(video: Path, words: list[dict], clip: Clip, index: int, prefix: str = "",
-           out: Path | None = None) -> Path:
-    """Cut the clip and make it 1080x1920: sharp video centered over a blurred fill."""
+           out: Path | None = None, style: str = "blur", watermark: str = "") -> Path:
+    """Cut the clip to 1080x1920. blur: sharp video over a blurred fill.
+    full: fill the screen, zoom, punchier colour."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     slug = re.sub(r"[^a-z0-9]+", "-", clip.title.lower()).strip("-")[:40] or "clip"
     tag = f"{prefix}-" if prefix else ""
     out = out or OUT_DIR / f"{tag}{index:02d}-{slug}.mp4"
     subs = out.with_suffix(".ass")
-    write_captions(words, clip, subs)
+    write_captions(words, clip, subs, style=style, watermark=watermark)
 
     ffmpeg, has_subs = find_ffmpeg()
     captions = f",subtitles='{subs.as_posix()}'" if has_subs else ""
-    vf = (
-        "[0:v]split[a][b];"
-        "[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:2[bg];"
-        "[b]scale=1080:-2[fg];"
-        f"[bg][fg]overlay=(W-w)/2:(H-h)/2{captions}[v]"
-    )
+    if style == "full":
+        z = zoom_expr(words, clip)
+        vf = (
+            "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+            f"scale=w='trunc(1080*({z})/2)*2':h='trunc(1920*({z})/2)*2':eval=frame,"
+            "crop=1080:1920,setsar=1,"
+            "eq=contrast=1.08:saturation=1.18,unsharp=5:5:0.6"
+            f"{captions}[v]"
+        )
+    else:
+        vf = (
+            "[0:v]split[a][b];"
+            "[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:2[bg];"
+            "[b]scale=1080:-2[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2{captions}[v]"
+        )
     cmd = [
         ffmpeg, "-y", "-loglevel", "error",
         "-ss", f"{clip.start:.2f}", "-to", f"{clip.end:.2f}", "-i", str(video),
@@ -320,10 +393,12 @@ class ClipperError(Exception):
 def clip_from_entry(entry: dict) -> Clip:
     data = {k: entry[k] for k in Clip.model_fields if k in entry}
     data.setdefault("overlay", "")  # clips made before on-screen text existed
+    data.setdefault("emphasis", [])
     return Clip(**data)
 
 
-def make_clips(source: str, count: int, whisper: str, log=print) -> Path:
+def make_clips(source: str, count: int, whisper: str, log=print,
+               style: str = "full", watermark: str = "") -> Path:
     """Fetch, transcribe, pick and render. Returns the path of the clips list."""
     log("Getting the video...")
     video = fetch(source)
@@ -340,8 +415,9 @@ def make_clips(source: str, count: int, whisper: str, log=print) -> Path:
     results = []
     for i, clip in enumerate(clips, 1):
         log(f"Cutting clip {i} of {len(clips)}: {clip.title}")
-        path = render(video, words, clip, i, prefix=stem)
-        results.append({**clip.model_dump(), "file": str(path), "source": str(video)})
+        path = render(video, words, clip, i, prefix=stem, style=style, watermark=watermark)
+        results.append({**clip.model_dump(), "file": str(path), "source": str(video),
+                        "style": style, "watermark": watermark})
 
     manifest = OUT_DIR / f"{stem}.clips.json"
     manifest.write_text(json.dumps(results, indent=2))
@@ -389,6 +465,8 @@ def main() -> None:
     p.add_argument("--whisper", default="small", help="Whisper model: tiny, base, small, medium")
     p.add_argument("--upload", action="store_true", help="Upload clips to YouTube")
     p.add_argument("--privacy", default="private", choices=["private", "unlisted", "public"])
+    p.add_argument("--style", default="full", choices=list(STYLES), help="full (zooms, glowing words) or blur")
+    p.add_argument("--watermark", default="", help="Small channel name under the captions, full style only")
     p.add_argument("--credit", default="", help='Credit line, e.g. "Clipped from @creator with permission"')
     args = p.parse_args()
 
@@ -399,7 +477,7 @@ def main() -> None:
         p.error("give a video file or URL, or use --upload-existing")
 
     try:
-        manifest = make_clips(args.source, args.count, args.whisper)
+        manifest = make_clips(args.source, args.count, args.whisper, style=args.style, watermark=args.watermark)
     except ClipperError as e:
         sys.exit(str(e))
     entries = json.loads(manifest.read_text())
