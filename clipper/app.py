@@ -151,6 +151,22 @@ with clips_tab:
                     st.success(f"Posted: {entry['url']}")
                 else:
                     entry["title"] = st.text_input("Title", entry["title"], key=f"t{chosen}{i}", max_chars=100)
+                    new_text = st.text_input("On-screen text", entry.get("overlay", ""), key=f"o{chosen}{i}",
+                                             help="The fixed text at the top of the video")
+                    source = Path(entry.get("source", ""))
+                    if new_text != entry.get("overlay", ""):
+                        if entry.get("source") and source.exists():
+                            if st.button("Update video", key=f"r{chosen}{i}"):
+                                with st.spinner("Re-cutting this clip..."):
+                                    entry["overlay"] = new_text
+                                    words = clipper.transcribe(source, "small")  # cached, so fast
+                                    tmp = path.with_name(path.stem + ".new.mp4")  # keep the old clip if this fails
+                                    clipper.render(source, words, clipper.clip_from_entry(entry), i + 1, out=tmp)
+                                    tmp.replace(path)
+                                    manifest.write_text(json.dumps(entries, indent=2))
+                                st.rerun()
+                        else:
+                            st.caption("Can't change the text on clips made before this update.")
                     if path.exists() and st.checkbox("Upload this one", key=f"u{chosen}{i}"):
                         selected.append(entry)
 
@@ -162,7 +178,7 @@ with clips_tab:
                 yt = clipper.youtube_client()
                 bar = st.progress(0.0)
                 for n, entry in enumerate(selected, 1):
-                    clip = clipper.Clip(**{k: entry[k] for k in clipper.Clip.model_fields})
+                    clip = clipper.clip_from_entry(entry)
                     entry["url"] = clipper.upload(yt, Path(entry["file"]), clip, privacy, credit)
                     manifest.write_text(json.dumps(entries, indent=2))
                     bar.progress(n / len(selected), text=f"Uploaded {n} of {len(selected)}")

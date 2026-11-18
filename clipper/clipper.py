@@ -89,6 +89,10 @@ class Clip(BaseModel):
     hook: str = Field(description="The first line viewers hear, quoted from the transcript")
     reason: str = Field(description="One sentence on why this moment will hold attention")
     score: int = Field(description="Virality score from 1 to 10")
+    overlay: str = Field(
+        default="",
+        description="On-screen hook text shown for the whole clip, 3 to 8 words, no emojis",
+    )
 
 
 class ClipPlan(BaseModel):
@@ -104,6 +108,12 @@ conflict, or a strong emotion. Never opens on filler like "so", "um", or "anyway
 - Stands alone. A viewer with zero context understands it.
 - Has a payoff: a punchline, a reveal, a useful insight, or a strong opinion.
 - Starts and ends on sentence boundaries so it doesn't cut mid-word.
+
+For each clip also write overlay: the fixed text shown on screen for the whole clip, \
+the thing that stops a scroller. 3 to 8 words. Build curiosity without spoiling the \
+payoff, for example "JYNXZI REACTS TO A CLIP OF HIMSELF..." or "HE DID NOT EXPECT THIS". \
+Name the creator if the transcript makes clear who it is. It must be true to the clip. \
+No emojis and no hashtags.
 
 Use only timestamps that appear in the transcript. Clips must not overlap. \
 Rank clips best first. Skip weak moments rather than padding the list."""
@@ -150,7 +160,7 @@ def ass_time(t: float) -> str:
 
 def write_captions(words: list[dict], clip: Clip, path: Path, per_line: int = 3) -> None:
     """Big, centered, 3-words-at-a-time captions, the standard Shorts style."""
-    header = """[Script Info]
+    header_tpl = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
@@ -158,19 +168,49 @@ PlayResY: 1920
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginV
 Style: Cap,Arial,84,&H00FFFFFF,&H00000000,&H80000000,1,6,2,2,560
+Style: Hook,Arial,{hook_size},&H00FFFFFF,&H00000000,&H80000000,1,7,3,2,{hook_margin}
 
 [Events]
 Format: Layer, Start, End, Style, Text
 """
     inside = [w for w in words if w["start"] >= clip.start and w["end"] <= clip.end]
     events = []
+    hook_lines = wrap_overlay(clip.overlay)
+    hook_size = {1: 96, 2: 92, 3: 80}.get(len(hook_lines), 0)
+    if not hook_size:  # long text: smaller font, wider lines, never cut words off
+        hook_lines, hook_size = wrap_overlay(clip.overlay, width=24), 64
+    if hook_lines:
+        # first half of the lines white, the rest cyan, like the usual Shorts style
+        parts = list(hook_lines)
+        if len(parts) > 1:
+            split = len(parts) // 2  # colour stays on for every line after this
+            parts[split] = "{\\c&H00FFFF00&}" + parts[split]
+        text = "\\N".join(parts)
+        events.append(f"Dialogue: 1,{ass_time(0)},{ass_time(clip.end - clip.start)},Hook,{text}")
     for i in range(0, len(inside), per_line):
         group = inside[i : i + per_line]
         start = group[0]["start"] - clip.start
         end = (inside[i + per_line]["start"] if i + per_line < len(inside) else group[-1]["end"]) - clip.start
         text = " ".join(w["text"] for w in group).upper().replace("{", "").replace("}", "")
         events.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Cap,{text}")
+    # sits in the blurred band above a 16:9 video (video top is about y=656)
+    header = header_tpl.replace("{hook_size}", str(hook_size)).replace("{hook_margin}", "1300")
     path.write_text(header + "\n".join(events) + "\n")
+
+
+EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]")
+
+
+def wrap_overlay(text: str, width: int = 17) -> list[str]:
+    """Upper-case, strip emojis and caption-breaking characters, wrap into short lines."""
+    text = EMOJI.sub("", text or "").upper().replace("{", "").replace("}", "").replace("\\", "")
+    lines: list[str] = []
+    for word in text.split():
+        if lines and len(lines[-1]) + 1 + len(word) <= width:
+            lines[-1] += " " + word
+        else:
+            lines.append(word)
+    return lines
 
 
 _FFMPEG: tuple[str, bool] | None = None
@@ -203,13 +243,14 @@ def find_ffmpeg() -> tuple[str, bool]:
     return _FFMPEG
 
 
-def render(video: Path, words: list[dict], clip: Clip, index: int, prefix: str = "") -> Path:
+def render(video: Path, words: list[dict], clip: Clip, index: int, prefix: str = "",
+           out: Path | None = None) -> Path:
     """Cut the clip and make it 1080x1920: sharp video centered over a blurred fill."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     slug = re.sub(r"[^a-z0-9]+", "-", clip.title.lower()).strip("-")[:40] or "clip"
     tag = f"{prefix}-" if prefix else ""
-    out = OUT_DIR / f"{tag}{index:02d}-{slug}.mp4"
-    subs = OUT_DIR / f"{tag}{index:02d}.ass"
+    out = out or OUT_DIR / f"{tag}{index:02d}-{slug}.mp4"
+    subs = out.with_suffix(".ass")
     write_captions(words, clip, subs)
 
     ffmpeg, has_subs = find_ffmpeg()
@@ -277,6 +318,10 @@ class ClipperError(Exception):
     pass
 
 
+def clip_from_entry(entry: dict) -> Clip:
+    return Clip(**{k: entry[k] for k in Clip.model_fields if k in entry})
+
+
 def make_clips(source: str, count: int, whisper: str, log=print) -> Path:
     """Fetch, transcribe, pick and render. Returns the path of the clips list."""
     log("Getting the video...")
@@ -295,7 +340,7 @@ def make_clips(source: str, count: int, whisper: str, log=print) -> Path:
     for i, clip in enumerate(clips, 1):
         log(f"Cutting clip {i} of {len(clips)}: {clip.title}")
         path = render(video, words, clip, i, prefix=stem)
-        results.append({**clip.model_dump(), "file": str(path)})
+        results.append({**clip.model_dump(), "file": str(path), "source": str(video)})
 
     manifest = OUT_DIR / f"{stem}.clips.json"
     manifest.write_text(json.dumps(results, indent=2))
@@ -326,7 +371,7 @@ def upload_existing(manifest: Path, privacy: str, credit: str) -> None:
         if answer != "y":
             print("    skipped\n")
             continue
-        clip = Clip(**{k: entry[k] for k in Clip.model_fields})
+        clip = clip_from_entry(entry)
         entry["url"] = upload(yt, path, clip, privacy, credit)
         manifest.write_text(json.dumps(entries, indent=2))  # save after each so a crash loses nothing
         print(f"    uploaded ({privacy}): {entry['url']}\n")
@@ -360,7 +405,7 @@ def main() -> None:
     if args.upload:
         yt = youtube_client()
         for entry in entries:
-            clip = Clip(**{k: entry[k] for k in Clip.model_fields})
+            clip = clip_from_entry(entry)
             entry["url"] = upload(yt, Path(entry["file"]), clip, args.privacy, args.credit)
             manifest.write_text(json.dumps(entries, indent=2))
             print(f"    uploaded ({args.privacy}): {entry['url']}")
