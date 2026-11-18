@@ -90,7 +90,6 @@ class Clip(BaseModel):
     reason: str = Field(description="One sentence on why this moment will hold attention")
     score: int = Field(description="Virality score from 1 to 10")
     overlay: str = Field(
-        default="",
         description="On-screen hook text shown for the whole clip, 3 to 8 words, no emojis",
     )
 
@@ -319,7 +318,9 @@ class ClipperError(Exception):
 
 
 def clip_from_entry(entry: dict) -> Clip:
-    return Clip(**{k: entry[k] for k in Clip.model_fields if k in entry})
+    data = {k: entry[k] for k in Clip.model_fields if k in entry}
+    data.setdefault("overlay", "")  # clips made before on-screen text existed
+    return Clip(**data)
 
 
 def make_clips(source: str, count: int, whisper: str, log=print) -> Path:
