@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import subprocess
 import sys
 from pathlib import Path
 
 import anthropic
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 OUT_DIR = Path(__file__).parent / "output"
@@ -94,6 +97,9 @@ class Clip(BaseModel):
     overlay: str = Field(
         description="On-screen hook text shown for the whole clip, 3 to 8 words, no emojis",
     )
+    mood: Literal["hype", "funny", "suspense", "emotional", "chill"] = Field(
+        description="Mood of background music that fits this clip",
+    )
     emphasis: list[str] = Field(
         description="5 to 12 single words spoken in the clip to highlight in colour in the captions",
     )
@@ -130,6 +136,9 @@ No emojis and no hashtags.
 Also list emphasis: 5 to 12 single words, spoken inside the clip, that carry the meaning \
 (names, numbers, surprising or emotional words). They light up in colour in the captions. \
 Never pick filler like "the", "and" or "like".
+
+Pick mood for the background music: hype for big reactions and wins, funny for jokes, \
+suspense for build-ups and reveals, emotional for heartfelt moments, chill for calm talk.
 
 Use only timestamps that appear in the transcript. Clips must not overlap. \
 Rank clips best first. Skip weak moments rather than padding the list."""
@@ -304,13 +313,70 @@ def find_ffmpeg() -> tuple[str, bool]:
     return _FFMPEG
 
 
+def key_times(words: list[dict], clip: Clip) -> list[float]:
+    """When each highlighted word is spoken, in clip time."""
+    keys = {norm(k) for phrase in clip.emphasis for k in phrase.split()} - {""}
+    return [w["start"] - clip.start for w in words
+            if clip.start <= w["start"] <= clip.end and norm(w["text"]) in keys]
+
+
+# ─── Sound: music and effects ────────────────────────────────────────────────
+HERE = Path(__file__).parent
+MUSIC_DIR = HERE / "music"
+SFX_DIR = HERE / "sfx"
+AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
+MOODS = ["hype", "funny", "suspense", "emotional", "chill"]
+
+# Built-in effects, synthesised by ffmpeg so there's nothing to license.
+SYNTH_SFX = {
+    "boom": "aevalsrc='0.9*sin(2*PI*(45+140*exp(-9*t))*t)*exp(-3.5*t)':d=0.9:s=44100",
+    "whoosh": "anoisesrc=d=0.45:c=pink:a=0.5:r=44100,highpass=f=700,lowpass=f=5000,"
+              "afade=t=in:d=0.3:curve=exp,afade=t=out:st=0.3:d=0.15",
+}
+
+
+def music_tracks(mood: str = "") -> list[Path]:
+    """Tracks in music/<mood>/, falling back to every track in music/."""
+    def scan(d: Path) -> list[Path]:
+        return sorted(p for p in d.rglob("*") if p.suffix.lower() in AUDIO_EXT) if d.exists() else []
+    return scan(MUSIC_DIR / mood) if mood and scan(MUSIC_DIR / mood) else scan(MUSIC_DIR)
+
+
+def sfx_file(name: str) -> Path:
+    """Your own sfx/<name>.* if you added one, otherwise a built-in synthesised one."""
+    if SFX_DIR.exists():
+        for p in sorted(SFX_DIR.glob(f"{name}.*")):
+            if p.suffix.lower() in AUDIO_EXT:
+                return p
+    cache = OUT_DIR / "sfx" / f"{name}.wav"
+    if not cache.exists():
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        ffmpeg, _ = find_ffmpeg()
+        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", SYNTH_SFX[name],
+                        "-ac", "2", str(cache)], check=True)
+    return cache
+
+
+def channels(video: Path) -> int:
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+                          "stream=channels", "-of", "csv=p=0", str(video)],
+                         capture_output=True, text=True).stdout.strip()
+    return int(out) if out.isdigit() else 2
+
+
+def sfx_times(words: list[dict], clip: Clip, min_gap: float = 2.0, limit: int = 6) -> list[float]:
+    """Whooshes on key words, spaced out so they don't get annoying."""
+    picked: list[float] = []
+    for t in key_times(words, clip):
+        if t > 0.8 and (not picked or t - picked[-1] >= min_gap):
+            picked.append(t)
+    return picked[:limit]
+
+
 def zoom_expr(words: list[dict], clip: Clip) -> str:
     """Slow push in and out all the time, plus a quick punch-in on each key word."""
-    keys = {norm(k) for phrase in clip.emphasis for k in phrase.split()} - {""}
-    punches = [w for w in words if clip.start <= w["start"] <= clip.end and norm(w["text"]) in keys][:20]
     z = "1.06+0.05*sin(2*PI*t/7)"
-    for w in punches:
-        a = w["start"] - clip.start
+    for a in key_times(words, clip)[:20]:
         z += f"+0.10*between(t,{a:.2f},{a + 0.45:.2f})"
     return z
 
@@ -358,7 +424,8 @@ def tighten(words: list[dict], clip: Clip):
 
 def render(video: Path, words: list[dict], clip: Clip, index: int, prefix: str = "",
            out: Path | None = None, style: str = "blur", watermark: str = "",
-           cut_pauses: bool = True) -> Path:
+           cut_pauses: bool = True, music: bool = True, music_volume: float = 0.22,
+           sfx: bool = True) -> Path:
     """Cut the clip to 1080x1920. blur: sharp video over a blurred fill.
     full: fill the screen, zoom, punchier colour."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -382,7 +449,42 @@ def render(video: Path, words: list[dict], clip: Clip, index: int, prefix: str =
         pre = f"{parts}{joined}concat=n={len(segs)}:v=1:a=1[cv][ca];"
         vin, audio = "[cv]", "[ca]"
     else:
-        pre, vin, audio = "", "[0:v]", "0:a?"
+        pre, vin, audio = "", "[0:v]", "[0:a]"
+
+    # Sound: speech on top, music ducked under it, effects on the hook and key words
+    duration = clip.end - clip.start
+    inputs: list[str] = []
+    track = None
+    if music:
+        tracks = music_tracks(clip.mood)
+        if tracks:
+            track = random.choice(tracks)
+            inputs += ["-stream_loop", "-1", "-ss", f"{random.uniform(0, 25):.1f}", "-i", str(track)]
+    hits = ([("boom", 0.0)] + [("whoosh", max(t - 0.25, 0)) for t in sfx_times(words, clip)]) if sfx else []
+    af, mix = "", [audio]
+    if track or hits:
+        # mono sources: copy to both channels so speech keeps its full loudness in the mix
+        up = "pan=stereo|c0=c0|c1=c0," if channels(video) == 1 else "aformat=channel_layouts=stereo,"
+        af += f"{audio}{up}asplit=2[sp][key];"
+        mix = ["[sp]"]
+        if track:
+            fade = max(duration - 0.8, 0)
+            af += (f"[1:a]aformat=channel_layouts=stereo,atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,"
+                   f"volume={music_volume},afade=t=in:d=0.4,afade=t=out:st={fade:.3f}:d=0.8[mu];"
+                   "[mu][key]sidechaincompress=threshold=0.03:ratio=8:attack=15:release=400[duck];")
+            mix.append("[duck]")
+        else:
+            af += "[key]anullsink;"
+        first_sfx = 2 if track else 1
+        for n, (name, t) in enumerate(hits):
+            inputs += ["-i", str(sfx_file(name))]
+            vol = 0.7 if name == "boom" else 0.35
+            af += (f"[{first_sfx + n}:a]aformat=channel_layouts=stereo,volume={vol},"
+                   f"adelay={int(t * 1000)}:all=1[fx{n}];")
+            mix.append(f"[fx{n}]")
+        af += (f"{''.join(mix)}amix=inputs={len(mix)}:duration=first:normalize=0,"
+               "alimiter=limit=0.95:level=0[aout];")
+        audio = "[aout]"
 
     ffmpeg, has_subs = find_ffmpeg()
     captions = f",subtitles='{subs.as_posix()}'" if has_subs else ""
@@ -395,6 +497,7 @@ def render(video: Path, words: list[dict], clip: Clip, index: int, prefix: str =
             "eq=contrast=1.08:saturation=1.18,unsharp=5:5:0.6"
             f"{captions}[v]"
         )
+        vf = af + vf
     else:
         vf = (
             f"{pre}{vin}split[a][b];"
@@ -402,9 +505,13 @@ def render(video: Path, words: list[dict], clip: Clip, index: int, prefix: str =
             "[b]scale=1080:-2[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2{captions}[v]"
         )
+        vf = af + vf
+    if audio == "[0:a]":
+        audio = "0:a?"  # plain copy of the original sound, no filter needed
     cmd = [
         ffmpeg, "-y", "-loglevel", "error",
         "-ss", f"{source_clip.start:.2f}", "-to", f"{source_clip.end:.2f}", "-i", str(video),
+        *inputs,
         "-filter_complex", vf, "-map", "[v]", "-map", audio,
         "-c:v", "libx264", "-preset", "medium", "-crf", "20",
         "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
@@ -463,11 +570,13 @@ def clip_from_entry(entry: dict) -> Clip:
     data = {k: entry[k] for k in Clip.model_fields if k in entry}
     data.setdefault("overlay", "")  # clips made before on-screen text existed
     data.setdefault("emphasis", [])
+    data.setdefault("mood", "hype")
     return Clip(**data)
 
 
 def make_clips(source: str, count: int, whisper: str, log=print,
-               style: str = "full", watermark: str = "", cut_pauses: bool = True) -> Path:
+               style: str = "full", watermark: str = "", cut_pauses: bool = True,
+               music: bool = True, music_volume: float = 0.22, sfx: bool = True) -> Path:
     """Fetch, transcribe, pick and render. Returns the path of the clips list."""
     log("Getting the video...")
     video = fetch(source)
@@ -485,9 +594,10 @@ def make_clips(source: str, count: int, whisper: str, log=print,
     for i, clip in enumerate(clips, 1):
         log(f"Cutting clip {i} of {len(clips)}: {clip.title}")
         path = render(video, words, clip, i, prefix=stem, style=style, watermark=watermark,
-                      cut_pauses=cut_pauses)
+                      cut_pauses=cut_pauses, music=music, music_volume=music_volume, sfx=sfx)
         results.append({**clip.model_dump(), "file": str(path), "source": str(video),
-                        "style": style, "watermark": watermark, "cut_pauses": cut_pauses})
+                        "style": style, "watermark": watermark, "cut_pauses": cut_pauses,
+                        "music": music, "music_volume": music_volume, "sfx": sfx})
 
     manifest = OUT_DIR / f"{stem}.clips.json"
     manifest.write_text(json.dumps(results, indent=2))
@@ -536,6 +646,8 @@ def main() -> None:
     p.add_argument("--upload", action="store_true", help="Upload clips to YouTube")
     p.add_argument("--privacy", default="private", choices=["private", "unlisted", "public"])
     p.add_argument("--style", default="full", choices=list(STYLES), help="full (zooms, glowing words) or blur")
+    p.add_argument("--no-music", action="store_true", help="No background music")
+    p.add_argument("--no-sfx", action="store_true", help="No sound effects")
     p.add_argument("--keep-pauses", action="store_true", help="Don't cut out pauses")
     p.add_argument("--watermark", default="", help="Small channel name under the captions, full style only")
     p.add_argument("--credit", default="", help='Credit line, e.g. "Clipped from @creator with permission"')
@@ -549,7 +661,8 @@ def main() -> None:
 
     try:
         manifest = make_clips(args.source, args.count, args.whisper, style=args.style, watermark=args.watermark,
-                              cut_pauses=not args.keep_pauses)
+                              cut_pauses=not args.keep_pauses, music=not args.no_music,
+                              sfx=not args.no_sfx)
     except ClipperError as e:
         sys.exit(str(e))
     entries = json.loads(manifest.read_text())

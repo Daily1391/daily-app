@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -38,6 +39,8 @@ def save_settings(**changes) -> None:
     SETTINGS_FILE.write_text(json.dumps({**load_settings(), **changes}, indent=2))
 
 
+VOLUMES = {"Quiet": 0.12, "Medium": 0.22, "Loud": 0.35}
+
 key = load_key()
 if key:
     os.environ["ANTHROPIC_API_KEY"] = key
@@ -69,6 +72,20 @@ with st.sidebar:
         st.warning("YouTube not set up. Add client_secret.json to the clipper folder.")
 
     st.divider()
+    st.subheader("Music")
+    for mood in clipper.MOODS:
+        (clipper.MUSIC_DIR / mood).mkdir(parents=True, exist_ok=True)
+    counts = {m: sum(p.suffix.lower() in clipper.AUDIO_EXT for p in (clipper.MUSIC_DIR / m).rglob("*"))
+              for m in clipper.MOODS}
+    if sum(counts.values()):
+        st.caption(" · ".join(f"{m}: {n}" for m, n in counts.items()))
+    else:
+        st.warning("No music yet. Put tracks you're allowed to use in the music folders.")
+    if st.button("Open music folder"):
+        subprocess.run(["open", str(clipper.MUSIC_DIR)])
+    st.caption("Free, safe tracks: YouTube Studio → Audio Library → Download. "
+               "Popular songs get your clips claimed or muted.")
+    st.divider()
     st.caption("Only post clips from creators who allow it. Read every title before posting.")
 
 
@@ -93,6 +110,13 @@ with make_tab:
     watermark = c4.text_input("Watermark (your channel name)", settings.get("watermark", ""),
                               disabled=style != "full", help="Small text under the captions")
     cut_pauses = st.checkbox("Cut out pauses (keeps people watching)", value=settings.get("cut_pauses", True))
+    c5, c6, c7 = st.columns(3)
+    music = c5.checkbox("Background music", value=settings.get("music", True),
+                        help="Picks a track from your music folder that fits the clip's mood")
+    music_volume = c6.select_slider("Music volume", ["Quiet", "Medium", "Loud"],
+                                    value=settings.get("music_volume", "Medium"), disabled=not music)
+    sfx = c7.checkbox("Sound effects", value=settings.get("sfx", True),
+                      help="A boom on the hook and whooshes on the zoom-ins")
 
     if st.button("Make clips", type="primary", disabled=not key):
         if not uploaded and not link.strip():
@@ -111,10 +135,12 @@ with make_tab:
 
             with st.status("Working… a long video can take 10 to 20 minutes.", expanded=True) as status:
                 try:
-                    save_settings(style=style, watermark=watermark, cut_pauses=cut_pauses)
+                    save_settings(style=style, watermark=watermark, cut_pauses=cut_pauses,
+                                  music=music, music_volume=music_volume, sfx=sfx)
                     manifest = clipper.make_clips(
                         source, count, "base" if speed == "Fast" else "small", log=st.write,
                         style=style, watermark=watermark, cut_pauses=cut_pauses,
+                        music=music, music_volume=VOLUMES[music_volume], sfx=sfx,
                     )
                 except Exception as e:  # show any failure in the page, not a crash
                     status.update(label="Something went wrong", state="error")
@@ -174,7 +200,10 @@ with clips_tab:
                                     clipper.render(source, words, clipper.clip_from_entry(entry), i + 1, out=tmp,
                                                    style=entry.get("style", "blur"),
                                                    watermark=entry.get("watermark", ""),
-                                                   cut_pauses=entry.get("cut_pauses", False))
+                                                   cut_pauses=entry.get("cut_pauses", False),
+                                                   music=entry.get("music", False),
+                                                   music_volume=entry.get("music_volume", 0.22),
+                                                   sfx=entry.get("sfx", False))
                                     tmp.replace(path)
                                     manifest.write_text(json.dumps(entries, indent=2))
                                 st.rerun()
