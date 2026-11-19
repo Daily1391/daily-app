@@ -184,7 +184,8 @@ def ass_time(t: float) -> str:
     return f"{int(h)}:{int(m):02d}:{s:05.2f}"
 
 
-STYLES = {"full": "Full screen with zooms", "blur": "Blurred background"}
+STYLES = {"full": "Full screen with zooms", "stream": "Streamer: facecam top, gameplay bottom",
+          "blur": "Blurred background"}
 GLOW = ["&H0050FF39&", "&H00FFE500&"]  # green, cyan (ASS colours are BGR)
 
 
@@ -228,10 +229,12 @@ Format: Layer, Start, End, Style, Text
             split = len(parts) // 2  # colour stays on for every line after this
             parts[split] = "{\\c&H00FFFF00&}" + parts[split]
         text = "\\N".join(parts)
+        if style == "stream":  # sits on the line between facecam and gameplay
+            text = "{\\an5\\pos(540,960)}" + text
         events.append(f"Dialogue: 1,{ass_time(0)},{ass_time(clip.end - clip.start)},Hook,{text}")
     hook_margin = "1300" if style == "blur" else "1420"  # full: near the top of the screen
 
-    if style == "full":
+    if style in ("full", "stream"):
         keys = {norm(k) for phrase in clip.emphasis for k in phrase.split()} - {""}
         n_key = 0
         for i, w in enumerate(inside):
@@ -247,12 +250,15 @@ Format: Layer, Start, End, Style, Text
             else:
                 fill, colour, glow_alpha = "&H00FFFFFF&", "&H00FFFFFF&", "&HB0&"
             pop = "\\fscx80\\fscy80\\t(0,90,\\fscx100\\fscy100)"
+            if style == "stream":  # in the gameplay half, below the hook
+                pop = "\\an2\\pos(540,1430)" + pop
             t0, t1 = ass_time(start), ass_time(end)
             # layer 2: soft coloured glow behind; layer 3: crisp word on top
             events.append(f"Dialogue: 2,{t0},{t1},Word,{{{pop}\\1a&HFF&\\3c{colour}\\3a{glow_alpha}\\bord16\\blur14}}{word}")
             events.append(f"Dialogue: 3,{t0},{t1},Word,{{{pop}\\c{fill}}}{word}")
+        mark_pos = "{\\an8\\pos(540,1445)}" if style == "stream" else ""
         if watermark.strip():
-            events.append(f"Dialogue: 1,{ass_time(0)},{ass_time(clip.end - clip.start)},Mark,{esc(watermark).upper()}")
+            events.append(f"Dialogue: 1,{ass_time(0)},{ass_time(clip.end - clip.start)},Mark,{mark_pos}{esc(watermark).upper()}")
         header = header_tpl.replace("{hook_size}", str(hook_size)).replace("{hook_margin}", hook_margin)
         path.write_text(header + "\n".join(events) + "\n")
         return
@@ -422,12 +428,92 @@ def tighten(words: list[dict], clip: Clip):
     return segs, new_words, clip.model_copy(update={"start": 0.0, "end": kept})
 
 
+# ─── Facecam ─────────────────────────────────────────────────────────────────
+def video_size(video: Path) -> tuple[int, int]:
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                          "stream=width,height", "-of", "csv=p=0", str(video)],
+                         capture_output=True, text=True).stdout.strip().split(",")
+    return int(out[0]), int(out[1])
+
+
+def grab_frame(video: Path, t: float, out: Path, width: int = 960) -> Path:
+    ffmpeg, _ = find_ffmpeg()
+    subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", str(video),
+                    "-frames:v", "1", "-vf", f"scale={width}:-2", str(out)], check=True)
+    return out
+
+
+def find_facecam(video: Path, samples: int = 14) -> list[float] | None:
+    """Look for the streamer's face in frames spread through the video and return the
+    facecam box as [x, y, w, h] fractions of the frame. None if no steady face is found."""
+    cache = OUT_DIR / f"{video.stem}.cam.json"
+    if cache.exists():
+        return json.loads(cache.read_text())["cam"]
+    import cv2
+
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                "-of", "csv=p=0", str(video)], capture_output=True, text=True).stdout or 0)
+    tmp = OUT_DIR / "frames"
+    tmp.mkdir(parents=True, exist_ok=True)
+    faces = []  # (cx, cy, size) as fractions
+    for k in range(samples):
+        t = dur * (k + 0.5) / samples
+        img = cv2.imread(str(grab_frame(video, t, tmp / f"f{k}.png")))
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        found = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(int(h * 0.06),) * 2)
+        for fx, fy, fw, fh in found:
+            faces.append(((fx + fw / 2) / w, (fy + fh / 2) / h, fw / w, h))
+    if not faces:
+        result = None
+    else:
+        # the facecam is the face that shows up in the same spot most often
+        def near(a, b):
+            return abs(a[0] - b[0]) < 0.06 and abs(a[1] - b[1]) < 0.06
+        best = max(faces, key=lambda f: sum(near(f, g) for g in faces))
+        group = [g for g in faces if near(best, g)]
+        if len(group) < max(2, samples // 4):
+            result = None
+        else:
+            cx = sorted(g[0] for g in group)[len(group) // 2]
+            cy = sorted(g[1] for g in group)[len(group) // 2]
+            size = sorted(g[2] for g in group)[len(group) // 2]
+            frame_w, frame_h = video_size(video)
+            # a 9:8 box about 3.4 face-widths wide, face a little above centre
+            bw = min(size * 3.4, 1.0)
+            bh = min(bw * frame_w / frame_h * 8 / 9, 1.0)
+            bx = min(max(cx - bw / 2, 0), 1 - bw)
+            by = min(max(cy - bh * 0.45, 0), 1 - bh)
+            result = [round(float(v), 4) for v in (bx, by, bw, bh)]
+    cache.write_text(json.dumps({"cam": result}))
+    return result
+
+
+def cam_preview(video: Path, cam: list[float], out: Path) -> Path:
+    """A frame from the video with the facecam box drawn on it."""
+    dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
+                                "csv=p=0", str(video)], capture_output=True, text=True).stdout or 60)
+    grab_frame(video, min(30.0, dur / 2), out, width=640)
+    x, y, w, h = cam
+    ffmpeg, _ = find_ffmpeg()
+    tmp = out.with_name(out.stem + "-box.png")
+    subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(out), "-vf",
+                    f"drawbox=x=iw*{x}:y=ih*{y}:w=iw*{w}:h=ih*{h}:color=lime:t=4", str(tmp)], check=True)
+    return tmp
+
+
 def render(video: Path, words: list[dict], clip: Clip, index: int, prefix: str = "",
            out: Path | None = None, style: str = "blur", watermark: str = "",
            cut_pauses: bool = True, music: bool = True, music_volume: float = 0.22,
-           sfx: bool = True) -> Path:
+           sfx: bool = True, cam: list[float] | None = None) -> Path:
     """Cut the clip to 1080x1920. blur: sharp video over a blurred fill.
-    full: fill the screen, zoom, punchier colour."""
+    full: fill the screen, zoom, punchier colour.
+    stream: facecam box (cam) on top, gameplay below."""
+    if style == "stream" and not cam:
+        style = "full"  # no facecam to put on top
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     slug = re.sub(r"[^a-z0-9]+", "-", clip.title.lower()).strip("-")[:40] or "clip"
     tag = f"{prefix}-" if prefix else ""
@@ -495,6 +581,22 @@ def render(video: Path, words: list[dict], clip: Clip, index: int, prefix: str =
             f"scale=w='trunc(1080*({z})/2)*2':h='trunc(1920*({z})/2)*2':eval=frame,"
             "crop=1080:1920,setsar=1,"
             "eq=contrast=1.08:saturation=1.18,unsharp=5:5:0.6"
+            f"{captions}[v]"
+        )
+        vf = af + vf
+    elif style == "stream":
+        z = zoom_expr(words, clip)
+        fw, fh = video_size(video)
+        x, y, w, h = cam
+        cx, cy = int(fw * x) // 2 * 2, int(fh * y) // 2 * 2
+        cw, ch = max(int(fw * w) // 2 * 2, 16), max(int(fh * h) // 2 * 2, 16)
+        vf = (
+            f"{pre}{vin}split[cam][game];"
+            f"[cam]crop={cw}:{ch}:{cx}:{cy},scale=1080:960:force_original_aspect_ratio=increase,"
+            f"crop=1080:960,scale=w='trunc(1080*({z})/2)*2':h='trunc(960*({z})/2)*2':eval=frame,"
+            "crop=1080:960[top];"
+            "[game]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[bottom];"
+            "[top][bottom]vstack,setsar=1,eq=contrast=1.06:saturation=1.15,unsharp=5:5:0.5"
             f"{captions}[v]"
         )
         vf = af + vf
@@ -578,6 +680,7 @@ def make_clips(source: str, count: int, whisper: str, log=print,
                style: str = "full", watermark: str = "", cut_pauses: bool = True,
                music: bool = True, music_volume: float = 0.22, sfx: bool = True) -> Path:
     """Fetch, transcribe, pick and render. Returns the path of the clips list."""
+    cam = None
     log("Getting the video...")
     video = fetch(source)
     log("Transcribing (the slow part)...")
@@ -589,15 +692,23 @@ def make_clips(source: str, count: int, whisper: str, log=print,
     if not clips:
         raise ClipperError("Claude found no clips worth posting in this video.")
 
+    if style == "stream":
+        log("Finding the facecam...")
+        cam = find_facecam(video)
+        if not cam:
+            log("No facecam found, so these clips use the full screen look. "
+                "You can set the facecam box by hand in My clips.")
+
     stem = re.sub(r"[^A-Za-z0-9]+", "-", video.stem).strip("-")[:40] or "video"
     results = []
     for i, clip in enumerate(clips, 1):
         log(f"Cutting clip {i} of {len(clips)}: {clip.title}")
         path = render(video, words, clip, i, prefix=stem, style=style, watermark=watermark,
-                      cut_pauses=cut_pauses, music=music, music_volume=music_volume, sfx=sfx)
+                      cut_pauses=cut_pauses, music=music, music_volume=music_volume, sfx=sfx,
+                      cam=cam)
         results.append({**clip.model_dump(), "file": str(path), "source": str(video),
                         "style": style, "watermark": watermark, "cut_pauses": cut_pauses,
-                        "music": music, "music_volume": music_volume, "sfx": sfx})
+                        "music": music, "music_volume": music_volume, "sfx": sfx, "cam": cam})
 
     manifest = OUT_DIR / f"{stem}.clips.json"
     manifest.write_text(json.dumps(results, indent=2))

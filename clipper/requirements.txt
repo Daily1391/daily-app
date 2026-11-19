@@ -6,3 +6,4 @@ yt-dlp
 google-api-python-client
 google-auth-oauthlib
 streamlit
+opencv-python-headless<5  # finds the facecam; v5 dropped the face finder

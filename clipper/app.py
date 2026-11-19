@@ -166,6 +166,44 @@ with clips_tab:
     manifest = clipper.OUT_DIR / chosen
     entries = json.loads(manifest.read_text())
 
+    # Facecam layout: check the box, fix it if needed, and re-cut every clip with it
+    src = Path(entries[0].get("source", "")) if entries and entries[0].get("source") else None
+    if src and src.exists() and any(not e.get("url") for e in entries):
+        is_stream = any(e.get("style") == "stream" for e in entries)
+        with st.expander("Facecam layout (streamer on top, gameplay below)", expanded=is_stream):
+            cam = next((e.get("cam") for e in entries if e.get("cam")), None)
+            if not cam:
+                with st.spinner("Looking for the facecam..."):
+                    cam = clipper.find_facecam(src)
+            if not cam:
+                st.info("Couldn't find a face automatically. Drag the sliders to box the facecam.")
+                cam = [0.0, 0.6, 0.25, 0.4]
+            k = chosen
+            s1, s2 = st.columns(2)
+            left = s1.slider("Left edge", 0, 100, int(cam[0] * 100), key=f"cx{k}")
+            top = s1.slider("Top edge", 0, 100, int(cam[1] * 100), key=f"cy{k}")
+            width = s2.slider("Width", 5, 100, int(cam[2] * 100), key=f"cw{k}")
+            height = s2.slider("Height", 5, 100, int(cam[3] * 100), key=f"ch{k}")
+            box = [left / 100, top / 100, min(width, 100 - left) / 100, min(height, 100 - top) / 100]
+            preview = clipper.cam_preview(src, box, clipper.OUT_DIR / f"{chosen}.preview.png")
+            st.image(str(preview), caption="The green box goes in the top half of every clip")
+            todo = [e for e in entries if not e.get("url")]
+            if st.button(f"Use this layout on {len(todo)} clips", type="primary"):
+                words = clipper.transcribe(src, "small")  # cached, so fast
+                bar = st.progress(0.0)
+                for n, (i, e) in enumerate([(i, e) for i, e in enumerate(entries) if not e.get("url")], 1):
+                    e["style"], e["cam"] = "stream", box
+                    path = Path(e["file"])
+                    tmp = path.with_name(path.stem + ".new.mp4")
+                    clipper.render(src, words, clipper.clip_from_entry(e), i + 1, out=tmp, style="stream",
+                                   watermark=e.get("watermark", ""), cut_pauses=e.get("cut_pauses", False),
+                                   music=e.get("music", False), music_volume=e.get("music_volume", 0.22),
+                                   sfx=e.get("sfx", False), cam=box)
+                    tmp.replace(path)
+                    manifest.write_text(json.dumps(entries, indent=2))
+                    bar.progress(n / len(todo), text=f"Re-cut {n} of {len(todo)}")
+                st.rerun()
+
     c1, c2 = st.columns([1, 2])
     privacy = c1.selectbox("Post as", ["public", "unlisted", "private"],
                            index=["public", "unlisted", "private"].index(settings.get("privacy", "private")))
@@ -203,7 +241,8 @@ with clips_tab:
                                                    cut_pauses=entry.get("cut_pauses", False),
                                                    music=entry.get("music", False),
                                                    music_volume=entry.get("music_volume", 0.22),
-                                                   sfx=entry.get("sfx", False))
+                                                   sfx=entry.get("sfx", False),
+                                                   cam=entry.get("cam"))
                                     tmp.replace(path)
                                     manifest.write_text(json.dumps(entries, indent=2))
                                 st.rerun()
