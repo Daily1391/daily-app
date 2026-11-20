@@ -8,6 +8,16 @@ Turns a long video into vertical YouTube Shorts.
 4. Cuts each moment to 1080x1920 with a blurred background and big captions.
 5. Uploads to YouTube as **private** so you check each one before it goes public.
 
+## Install on a Mac (one line)
+
+Open Terminal and paste:
+
+```
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Daily1391/daily-app/claude/bot-creation-lcbtji/clipper/install.sh)"
+```
+
+It installs what Clipper needs and puts the app in a `Clipper` folder in your home folder. Run the same line again any time to update; your key, YouTube login, music and clips are kept.
+
 ## Easiest way: the app
 
 Double-click `Clipper.command`. A browser page opens where you drop in a video, make clips, watch them, edit titles, and pick which to upload. The first run installs everything (a few minutes). Keep the black window open while you use it; close it to stop.
