@@ -220,10 +220,9 @@ Format: Layer, Start, End, Style, Text
 """
     inside = [w for w in words if w["start"] >= clip.start and w["end"] <= clip.end]
     events = []
-    hook_lines = wrap_overlay(clip.overlay)
-    hook_size = {1: 96, 2: 92, 3: 80}.get(len(hook_lines), 0)
-    if not hook_size:  # long text: smaller font, wider lines, never cut words off
-        hook_lines, hook_size = wrap_overlay(clip.overlay, width=24), 64
+    # The hook is drawn as a picture by hook_image() and laid over the video, because some
+    # ffmpeg/libass builds silently skipped it. Nothing hook-related goes in this file.
+    hook_lines, hook_size = [], 64
     if hook_lines:
         # first half of the lines white, the rest cyan, like the usual Shorts style
         parts = list(hook_lines)
@@ -278,6 +277,53 @@ Format: Layer, Start, End, Style, Text
     # sits in the blurred band above a 16:9 video (video top is about y=656)
     header = header_tpl.replace("{hook_size}", str(hook_size)).replace("{hook_margin}", hook_margin)
     path.write_text(header + "\n".join(events) + "\n")
+
+
+FONT_CANDIDATES = [
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "/Library/Fonts/Arial Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Black.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/crosextra/Carlito-Bold.ttf",
+]
+
+
+def hook_layout(text: str) -> tuple[list[str], int]:
+    lines = wrap_overlay(text)
+    size = {1: 96, 2: 92, 3: 80}.get(len(lines), 0)
+    if not size:  # long text: smaller font, wider lines, never cut words off
+        lines, size = wrap_overlay(text, width=24), 64
+    return lines, size
+
+
+def hook_image(text: str, out: Path) -> tuple[Path, int] | None:
+    """Draw the hook as a transparent 1080-wide PNG: white first half, cyan second half,
+    thick black outline and a soft shadow. Returns the file and its height."""
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+    lines, size = hook_layout(text)
+    if not lines:
+        return None
+    font_path = next((f for f in FONT_CANDIDATES if Path(f).exists()), None)
+    font = ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default(size)
+    stroke, gap = max(size // 12, 4), int(size * 0.18)
+    line_h = size + gap
+    height = line_h * len(lines) + stroke * 2 + 20
+    split = len(lines) // 2 if len(lines) > 1 else len(lines)
+    text_layer = Image.new("RGBA", (1080, height), (0, 0, 0, 0))
+    shadow = Image.new("RGBA", (1080, height), (0, 0, 0, 0))
+    draw, sdraw = ImageDraw.Draw(text_layer), ImageDraw.Draw(shadow)
+    for n, line in enumerate(lines):
+        width = draw.textlength(line, font=font)
+        x, y = (1080 - width) / 2, stroke + 10 + n * line_h
+        colour = (255, 255, 255, 255) if n < split else (0, 255, 255, 255)
+        sdraw.text((x + 5, y + 7), line, font=font, fill=(0, 0, 0, 170),
+                   stroke_width=stroke, stroke_fill=(0, 0, 0, 170))
+        draw.text((x, y), line, font=font, fill=colour, stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(6))
+    Image.alpha_composite(shadow, text_layer).save(out)
+    return out, height
 
 
 EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]")
@@ -580,6 +626,13 @@ def render(video: Path, words: list[dict], clip: Clip, index: int, prefix: str =
 
     ffmpeg, has_subs = find_ffmpeg()
     captions = f",subtitles='{subs.as_posix()}'" if has_subs else ""
+    hook = hook_image(clip.overlay, out.with_suffix(".hook.png"))
+    if hook:
+        img, h = hook
+        idx = 1 + inputs.count("-i")  # inputs so far: music and sound effects
+        inputs += ["-i", str(img)]
+        y = {"stream": 960 - h // 2, "blur": 620 - h}.get(style, 500 - h)
+        captions += f"[base];[base][{idx}:v]overlay=0:{max(y, 0)}:format=auto"
     if style == "full":
         z = zoom_expr(words, clip)
         vf = (
