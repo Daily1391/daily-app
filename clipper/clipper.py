@@ -205,13 +205,15 @@ def write_captions(words: list[dict], clip: Clip, path: Path, per_line: int = 3,
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
+WrapStyle: 2
+ScaledBorderAndShadow: yes
 
 [V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Outline, Shadow, Alignment, MarginV
-Style: Cap,Arial,84,&H00FFFFFF,&H00000000,&H80000000,1,6,2,2,560
-Style: Hook,Arial,{hook_size},&H00FFFFFF,&H00000000,&H80000000,1,7,3,2,{hook_margin}
-Style: Word,Arial,128,&H00FFFFFF,&H00000000,&H90000000,1,5,4,2,980
-Style: Mark,Arial,36,&H60FFFFFF,&H00000000,&HFF000000,0,1,0,8,955
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Cap,Arial,84,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,6,2,2,20,20,560,1
+Style: Hook,Arial,{hook_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,7,3,2,20,20,{hook_margin},1
+Style: Word,Arial,128,&H00FFFFFF,&H00FFFFFF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,5,4,2,20,20,980,1
+Style: Mark,Arial,36,&H60FFFFFF,&H60FFFFFF,&H00000000,&HFF000000,0,0,0,0,100,100,0,0,1,1,0,8,20,20,955,1
 
 [Events]
 Format: Layer, Start, End, Style, Text
@@ -229,10 +231,14 @@ Format: Layer, Start, End, Style, Text
             split = len(parts) // 2  # colour stays on for every line after this
             parts[split] = "{\\c&H00FFFF00&}" + parts[split]
         text = "\\N".join(parts)
-        if style == "stream":  # sits on the line between facecam and gameplay
-            text = "{\\an5\\pos(540,960)}" + text
-        events.append(f"Dialogue: 1,{ass_time(0)},{ass_time(clip.end - clip.start)},Hook,{text}")
+        # Spell out position, size and look on the line itself so it doesn't depend on
+        # how a given ffmpeg/libass reads the style. stream: on the line between halves.
+        an, y = {"stream": (5, 960), "blur": (2, 620)}.get(style, (2, 500))
+        look = f"\\an{an}\\pos(540,{y})\\fs{{size}}\\b1\\bord7\\shad3\\fscx100\\fscy100\\1a&H00&\\c&HFFFFFF&"
+        text = "{" + look + "}" + text
+        events.append(f"Dialogue: 5,{ass_time(0)},{ass_time(clip.end - clip.start)},Hook,{text}")
     hook_margin = "1300" if style == "blur" else "1420"  # full: near the top of the screen
+    events = [e.replace("{size}", str(hook_size)) for e in events]
 
     if style in ("full", "stream"):
         keys = {norm(k) for phrase in clip.emphasis for k in phrase.split()} - {""}
