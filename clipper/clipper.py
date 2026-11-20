@@ -76,13 +76,51 @@ def transcribe(video: Path, model_size: str) -> list[dict]:
     return words
 
 
-def transcript_lines(words: list[dict], chunk: int = 12) -> str:
-    """Group words into timestamped lines Claude can read: [12.3-16.1] text"""
+def loudness(video: Path) -> list[float]:
+    """Loudness (dB) of each second of audio. Shouting, laughing and screaming show up as
+    spikes, which the transcript alone can't show Claude. Cached next to the transcript."""
+    cache = OUT_DIR / f"{video.stem}.loud.json"
+    if cache.exists():
+        return json.loads(cache.read_text())
+    ffmpeg, _ = find_ffmpeg()
+    proc = subprocess.run(
+        [ffmpeg, "-hide_banner", "-nostats", "-i", str(video), "-vn", "-af",
+         "aresample=8000,asetnsamples=8000,astats=metadata=1:reset=1,"
+         "ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-", "-f", "null", "-"],
+        capture_output=True, text=True)
+    levels = []
+    for line in proc.stdout.splitlines():
+        if "RMS_level=" in line:
+            v = line.split("=", 1)[1].strip()
+            levels.append(float(v) if v not in ("-inf", "inf", "nan") else -90.0)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(levels))
+    return levels
+
+
+def transcript_lines(words: list[dict], chunk: int = 12, loud: list[float] | None = None) -> str:
+    """Group words into timestamped lines Claude can read: [12.3-16.1] text
+    Lines where the audio spikes get a [LOUD] or [VERY LOUD] tag."""
+    marks: dict[int, str] = {}
+    if loud and len(loud) > 30:
+        ordered = sorted(loud)
+        median = ordered[len(ordered) // 2]
+        # must be in the loudest slice of the video AND clearly louder than normal talking
+        p85 = max(ordered[int(len(ordered) * 0.85)], median + 6)
+        p95 = max(ordered[int(len(ordered) * 0.95)], median + 10)
+        for sec, db in enumerate(loud):
+            if db >= p95:
+                marks[sec] = " [VERY LOUD]"
+            elif db >= p85:
+                marks.setdefault(sec, " [LOUD]")
     lines = []
     for i in range(0, len(words), chunk):
         part = words[i : i + chunk]
         text = " ".join(w["text"] for w in part)
-        lines.append(f"[{part[0]['start']:.1f}-{part[-1]['end']:.1f}] {text}")
+        secs = range(int(part[0]["start"]), int(part[-1]["end"]) + 1)
+        tags = [marks[t] for t in secs if t in marks]
+        tag = " [VERY LOUD]" if " [VERY LOUD]" in tags else (" [LOUD]" if tags else "")
+        lines.append(f"[{part[0]['start']:.1f}-{part[-1]['end']:.1f}]{tag} {text}")
     return "\n".join(lines)
 
 
@@ -96,6 +134,9 @@ class Clip(BaseModel):
     score: int = Field(description="Virality score from 1 to 10")
     overlay: str = Field(
         description="On-screen hook text shown for the whole clip, 3 to 8 words, no emojis",
+    )
+    kind: Literal["funny", "hype", "drama", "story", "insight"] = Field(
+        description="What kind of moment this is",
     )
     mood: Literal["hype", "funny", "suspense", "emotional", "chill"] = Field(
         description="Mood of background music that fits this clip",
@@ -140,16 +181,35 @@ Never pick filler like "the", "and" or "like".
 Pick mood for the background music: hype for big reactions and wins, funny for jokes, \
 suspense for build-ups and reveals, emotional for heartfelt moments, chill for calm talk.
 
+Funny moments are the easiest to miss in a transcript, so hunt for them on purpose: \
+absurd or unhinged lines, roasts and comebacks, someone getting caught out or \
+embarrassed, awkward silences broken by a punchline, chat or a friend saying something \
+wild, failing at something confidently, and anything followed by "bro", "nah", "what", \
+"I'm crying", "stop" or laughter written out. Lines tagged [LOUD] or [VERY LOUD] are \
+where the audio spikes: shouting, screaming, laughing, a big reaction. Check every one \
+of those; many of the best funny and hype clips start a few seconds before the spike \
+and end right after it. Label each clip's kind.
+
 Use only timestamps that appear in the transcript. Clips must not overlap. \
 Rank clips best first. Skip weak moments rather than padding the list."""
 
 
-def pick_clips(words: list[dict], count: int) -> list[Clip]:
+FOCUS = {
+    "mix": "Give a mix of kinds. If the video has funny moments, at least a third of the "
+           "clips should be funny.",
+    "funny": "Mostly funny clips. Only include another kind if it is clearly stronger than "
+             "every funny moment left.",
+    "hype": "Mostly hype clips: big reactions, wins, shocking moments.",
+}
+
+
+def pick_clips(words: list[dict], count: int, loud: list[float] | None = None,
+               focus: str = "mix") -> list[Clip]:
     client = anthropic.Anthropic()
     prompt = (
         f"Find up to {count} clips, ideally {TARGET} seconds and never under {MIN_LEN:.0f} "
-        f"or over {MAX_LEN:.0f} seconds, "
-        f"in this transcript.\n\n<transcript>\n{transcript_lines(words)}\n</transcript>"
+        f"or over {MAX_LEN:.0f} seconds. {FOCUS.get(focus, FOCUS['mix'])}\n\n"
+        f"<transcript>\n{transcript_lines(words, loud=loud)}\n</transcript>"
     )
     print("Asking Claude for the best moments...")
     response = client.beta.messages.parse(
@@ -732,12 +792,14 @@ def clip_from_entry(entry: dict) -> Clip:
     data.setdefault("overlay", "")  # clips made before on-screen text existed
     data.setdefault("emphasis", [])
     data.setdefault("mood", "hype")
+    data.setdefault("kind", "story")
     return Clip(**data)
 
 
 def make_clips(source: str, count: int, whisper: str, log=print,
                style: str = "full", watermark: str = "", cut_pauses: bool = True,
-               music: bool = True, music_volume: float = 0.22, sfx: bool = True) -> Path:
+               music: bool = True, music_volume: float = 0.22, sfx: bool = True,
+               focus: str = "mix") -> Path:
     """Fetch, transcribe, pick and render. Returns the path of the clips list."""
     cam = None
     log("Getting the video...")
@@ -746,8 +808,10 @@ def make_clips(source: str, count: int, whisper: str, log=print,
     words = transcribe(video, whisper)
     if not words:
         raise ClipperError("No speech found. This bot picks clips from what people say.")
+    log("Listening for laughs, yelling and big reactions...")
+    loud = loudness(video)
     log("Asking Claude for the best moments...")
-    clips = pick_clips(words, count)
+    clips = pick_clips(words, count, loud=loud, focus=focus)
     if not clips:
         raise ClipperError("Claude found no clips worth posting in this video.")
 
@@ -812,6 +876,7 @@ def main() -> None:
     p.add_argument("--upload-existing", metavar="CLIPS_JSON",
                    help="Upload clips already made, from an output/*.clips.json file")
     p.add_argument("--count", type=int, default=5, help="Max clips to make (default 5)")
+    p.add_argument("--focus", default="mix", choices=list(FOCUS), help="mix, funny or hype")
     p.add_argument("--whisper", default="small", help="Whisper model: tiny, base, small, medium")
     p.add_argument("--upload", action="store_true", help="Upload clips to YouTube")
     p.add_argument("--privacy", default="private", choices=["private", "unlisted", "public"])
@@ -832,7 +897,7 @@ def main() -> None:
     try:
         manifest = make_clips(args.source, args.count, args.whisper, style=args.style, watermark=args.watermark,
                               cut_pauses=not args.keep_pauses, music=not args.no_music,
-                              sfx=not args.no_sfx)
+                              sfx=not args.no_sfx, focus=args.focus)
     except ClipperError as e:
         sys.exit(str(e))
     entries = json.loads(manifest.read_text())

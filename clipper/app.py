@@ -101,6 +101,9 @@ with make_tab:
 
     c1, c2 = st.columns(2)
     count = c1.slider("How many clips", 1, 10, 5)
+    focus_names = {"mix": "Mix", "funny": "Mostly funny", "hype": "Mostly hype"}
+    focus = c1.radio("Look for", list(focus_names), format_func=focus_names.get, horizontal=True,
+                     index=list(focus_names).index(settings.get("focus", "mix")))
     speed = c2.radio("Transcription", ["Accurate (slower)", "Fast"], horizontal=True)
 
     c3, c4 = st.columns(2)
@@ -136,11 +139,11 @@ with make_tab:
             with st.status("Working… a long video can take 10 to 20 minutes.", expanded=True) as status:
                 try:
                     save_settings(style=style, watermark=watermark, cut_pauses=cut_pauses,
-                                  music=music, music_volume=music_volume, sfx=sfx)
+                                  music=music, music_volume=music_volume, sfx=sfx, focus=focus)
                     manifest = clipper.make_clips(
                         source, count, "base" if speed == "Fast" else "small", log=st.write,
                         style=style, watermark=watermark, cut_pauses=cut_pauses,
-                        music=music, music_volume=VOLUMES[music_volume], sfx=sfx,
+                        music=music, music_volume=VOLUMES[music_volume], sfx=sfx, focus=focus,
                     )
                 except Exception as e:  # show any failure in the page, not a crash
                     status.update(label="Something went wrong", state="error")
@@ -219,7 +222,9 @@ with clips_tab:
                     st.video(str(path))
                 else:
                     st.warning("Video file missing")
-                st.caption(f"Score {entry['score']}/10 · {entry['end'] - entry['start']:.0f}s · {entry['reason']}")
+                kind = entry.get("kind", "").capitalize()
+                st.caption(f"{kind + ' · ' if kind else ''}Score {entry['score']}/10 · "
+                           f"{entry['end'] - entry['start']:.0f}s · {entry['reason']}")
                 if entry.get("url"):
                     st.markdown(f"**{entry['title']}**")
                     st.success(f"Posted: {entry['url']}")
