@@ -228,26 +228,28 @@ with clips_tab:
                     new_text = st.text_input("On-screen text", entry.get("overlay", ""), key=f"o{chosen}{i}",
                                              help="The fixed text at the top of the video")
                     source = Path(entry.get("source", ""))
-                    if new_text != entry.get("overlay", ""):
-                        if entry.get("source") and source.exists():
-                            if st.button("Update video", key=f"r{chosen}{i}"):
-                                with st.spinner("Re-cutting this clip..."):
-                                    entry["overlay"] = new_text
-                                    words = clipper.transcribe(source, "small")  # cached, so fast
-                                    tmp = path.with_name(path.stem + ".new.mp4")  # keep the old clip if this fails
-                                    clipper.render(source, words, clipper.clip_from_entry(entry), i + 1, out=tmp,
-                                                   style=entry.get("style", "blur"),
-                                                   watermark=entry.get("watermark", ""),
-                                                   cut_pauses=entry.get("cut_pauses", False),
-                                                   music=entry.get("music", False),
-                                                   music_volume=entry.get("music_volume", 0.22),
-                                                   sfx=entry.get("sfx", False),
-                                                   cam=entry.get("cam"))
-                                    tmp.replace(path)
-                                    manifest.write_text(json.dumps(entries, indent=2))
-                                st.rerun()
-                        else:
-                            st.caption("Can't change the text on clips made before this update.")
+                    # Update video is always shown, so typing then clicking works without pressing Enter
+                    if entry.get("source") and source.exists():
+                        if st.button("Update video", key=f"r{chosen}{i}",
+                                     help="Type new text, then click to re-cut this clip with it"):
+                            with st.spinner("Re-cutting this clip..."):
+                                entry["overlay"] = new_text
+                                words = clipper.transcribe(source, "small")  # cached, so fast
+                                tmp = path.with_name(path.stem + ".new.mp4")  # keep the old clip if this fails
+                                clipper.render(source, words, clipper.clip_from_entry(entry), i + 1, out=tmp,
+                                               style=entry.get("style", "blur"),
+                                               watermark=entry.get("watermark", ""),
+                                               cut_pauses=entry.get("cut_pauses", False),
+                                               music=entry.get("music", False),
+                                               music_volume=entry.get("music_volume", 0.22),
+                                               sfx=entry.get("sfx", False),
+                                               cam=entry.get("cam"))
+                                tmp.replace(path)
+                                manifest.write_text(json.dumps(entries, indent=2))
+                            st.rerun()
+                    else:
+                        st.caption("This clip was made before text editing existed, or its source "
+                                   "video was moved. Make clips from the video again to edit it.")
                     if path.exists() and st.checkbox("Upload this one", key=f"u{chosen}{i}"):
                         selected.append(entry)
 
