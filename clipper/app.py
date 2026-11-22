@@ -278,6 +278,17 @@ with clips_tab:
                     manifest.write_text(json.dumps(entries, indent=2))
                     bar.progress(n / len(selected), text=f"Uploaded {n} of {len(selected)}")
             except Exception as e:
-                st.error(f"Upload stopped: {e}")
+                msg = str(e)
+                if "uploadLimitExceeded" in msg:
+                    st.error("YouTube says this channel has hit its upload limit for now. It resets "
+                             "within about 24 hours. Verifying your channel at youtube.com/verify raises it.")
+                elif "quotaExceeded" in msg:
+                    st.error("You've used today's upload allowance for your Google project (about 6 "
+                             "videos). It resets at midnight Pacific time.")
+                elif "SSL" in msg or "timed out" in msg or "Connection" in msg:
+                    st.error("The internet connection dropped during the upload. Click Upload again; "
+                             "clips that already went up won't be sent twice.")
+                else:
+                    st.error(f"Upload stopped: {e}")
             else:
                 st.rerun()
