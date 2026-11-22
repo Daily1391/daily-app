@@ -264,10 +264,17 @@ with clips_tab:
             manifest.write_text(json.dumps(entries, indent=2))  # keep edited titles
             try:
                 yt = clipper.youtube_client()
-                bar = st.progress(0.0)
+                total = len(selected)
+                bar = st.progress(0.0, text=f"Uploading 1 of {total}...")
                 for n, entry in enumerate(selected, 1):
                     clip = clipper.clip_from_entry(entry)
-                    entry["url"] = clipper.upload(yt, Path(entry["file"]), clip, privacy, credit)
+
+                    def show(p, n=n):
+                        bar.progress(min((n - 1 + p) / total, 1.0),
+                                     text=f"Uploading {n} of {total}: {int(p * 100)}%")
+
+                    entry["url"] = clipper.upload(yt, Path(entry["file"]), clip, privacy, credit,
+                                                  progress=show)
                     manifest.write_text(json.dumps(entries, indent=2))
                     bar.progress(n / len(selected), text=f"Uploaded {n} of {len(selected)}")
             except Exception as e:

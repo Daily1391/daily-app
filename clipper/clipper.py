@@ -747,6 +747,9 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
 def youtube_client():
+    import google_auth_httplib2
+    import httplib2
+    from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -757,16 +760,25 @@ def youtube_client():
     creds = Credentials.from_authorized_user_file(token, SCOPES) if token.exists() else None
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                # Logins for apps in Google's "Testing" mode expire after about a week.
+                creds = None
+        if not creds or not creds.valid:
             if not secret.exists():
                 raise ClipperError("Missing client_secret.json. See README, step 'YouTube setup'.")
             creds = InstalledAppFlow.from_client_secrets_file(secret, SCOPES).run_local_server(port=0)
         token.write_text(creds.to_json())
-    return build("youtube", "v3", credentials=creds)
+    # 5-minute network timeout instead of the library's 60 seconds, for slow upload speeds
+    http = google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=300))
+    return build("youtube", "v3", http=http)
 
 
-def upload(yt, path: Path, clip: Clip, privacy: str, credit: str) -> str:
+UPLOAD_CHUNK = 4 * 1024 * 1024  # small pieces, so no single request takes long on slow Wi-Fi
+
+
+def upload(yt, path: Path, clip: Clip, privacy: str, credit: str, progress=None) -> str:
     from googleapiclient.http import MediaFileUpload
 
     description = f"{clip.hook}\n\n{credit}\n\n#Shorts".strip()
@@ -775,11 +787,14 @@ def upload(yt, path: Path, clip: Clip, privacy: str, credit: str) -> str:
         "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False},
     }
     request = yt.videos().insert(
-        part="snippet,status", body=body, media_body=MediaFileUpload(str(path), resumable=True)
+        part="snippet,status", body=body,
+        media_body=MediaFileUpload(str(path), chunksize=UPLOAD_CHUNK, resumable=True),
     )
     response = None
     while response is None:
-        _, response = request.next_chunk()
+        status, response = request.next_chunk(num_retries=5)  # retries dropped pieces
+        if status and progress:
+            progress(status.progress())
     return f"https://youtube.com/shorts/{response['id']}"
 
 
