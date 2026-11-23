@@ -55,7 +55,7 @@ def fetch(source: str) -> Path:
 
 
 # ─── 2. Transcribe ───────────────────────────────────────────────────────────
-def transcribe(video: Path, model_size: str) -> list[dict]:
+def transcribe(video: Path, model_size: str, progress=None) -> list[dict]:
     """Return a list of words: {"start", "end", "text"}. Cached next to output."""
     cache = OUT_DIR / f"{video.stem}.words.json"
     if cache.exists():
@@ -65,12 +65,16 @@ def transcribe(video: Path, model_size: str) -> list[dict]:
 
     print(f"Transcribing with whisper '{model_size}' (first run downloads the model)...")
     model = WhisperModel(model_size, device="auto", compute_type="int8")
-    segments, _ = model.transcribe(str(video), word_timestamps=True, vad_filter=True)
-    words = [
-        {"start": round(w.start, 2), "end": round(w.end, 2), "text": w.word.strip()}
-        for seg in segments
-        for w in (seg.words or [])
-    ]
+    segments, info = model.transcribe(str(video), word_timestamps=True, vad_filter=True)
+    words, shown = [], -1
+    for seg in segments:
+        words += [{"start": round(w.start, 2), "end": round(w.end, 2), "text": w.word.strip()}
+                  for w in (seg.words or [])]
+        if progress and info.duration:
+            pct = min(int(seg.end / info.duration * 100), 100)
+            if pct >= shown + 2:  # every 2% so the page isn't redrawn constantly
+                shown = pct
+                progress(pct / 100)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     cache.write_text(json.dumps(words))
     return words
@@ -814,13 +818,13 @@ def clip_from_entry(entry: dict) -> Clip:
 def make_clips(source: str, count: int, whisper: str, log=print,
                style: str = "full", watermark: str = "", cut_pauses: bool = True,
                music: bool = True, music_volume: float = 0.22, sfx: bool = True,
-               focus: str = "mix") -> Path:
+               focus: str = "mix", progress=None) -> Path:
     """Fetch, transcribe, pick and render. Returns the path of the clips list."""
     cam = None
     log("Getting the video...")
     video = fetch(source)
     log("Transcribing (the slow part)...")
-    words = transcribe(video, whisper)
+    words = transcribe(video, whisper, progress=progress)
     if not words:
         raise ClipperError("No speech found. This bot picks clips from what people say.")
     log("Listening for laughs, yelling and big reactions...")

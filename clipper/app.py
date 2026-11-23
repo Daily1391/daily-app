@@ -140,10 +140,18 @@ with make_tab:
                 try:
                     save_settings(style=style, watermark=watermark, cut_pauses=cut_pauses,
                                   music=music, music_volume=music_volume, sfx=sfx, focus=focus)
+                    bars = {}
+
+                    def transcribe_progress(p):  # bar appears under "Transcribing" on first update
+                        if "bar" not in bars:
+                            bars["bar"] = st.progress(0.0)
+                        bars["bar"].progress(p, text=f"Transcribed {int(p * 100)}%")
+
                     manifest = clipper.make_clips(
                         source, count, "base" if speed == "Fast" else "small", log=st.write,
                         style=style, watermark=watermark, cut_pauses=cut_pauses,
                         music=music, music_volume=VOLUMES[music_volume], sfx=sfx, focus=focus,
+                        progress=transcribe_progress,
                     )
                 except Exception as e:  # show any failure in the page, not a crash
                     status.update(label="Something went wrong", state="error")
