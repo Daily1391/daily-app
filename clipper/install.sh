@@ -24,7 +24,7 @@ if [ -z "$SKIP_BREW" ]; then
         echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> "$HOME/.zprofile"
     fi
   fi
-  for pkg in python@3.12 ffmpeg-full; do
+  for pkg in python@3.12 ffmpeg-full deno; do
     if brew list --versions "$pkg" >/dev/null 2>&1; then
       echo "Already installed: $pkg"
     else

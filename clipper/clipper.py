@@ -49,9 +49,21 @@ def fetch(source: str) -> Path:
         "outtmpl": str(dl_dir / "%(id)s.%(ext)s"),
         "quiet": True,
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(source, download=True)
-        return Path(ydl.prepare_filename(info)).with_suffix(".mp4")
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(source, download=False)
+            if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
+                raise ClipperError("That stream is still live. Clip it after it ends and the replay is up.")
+            info = ydl.extract_info(source, download=True)
+            return Path(ydl.prepare_filename(info)).with_suffix(".mp4")
+    except yt_dlp.utils.DownloadError as e:
+        msg = str(e)
+        hint = ""
+        if "not a bot" in msg or "Sign in" in msg:
+            hint = " YouTube is blocking automated downloads right now. Download the video another way and upload the file instead."
+        elif "youtube" in source.lower():
+            hint = " If this keeps happening, close Clipper, run 'brew install deno' in Terminal, and try again."
+        raise ClipperError(f"Couldn't download that video.{hint}\n\nDetails: {msg}") from e
 
 
 # ─── 2. Transcribe ───────────────────────────────────────────────────────────

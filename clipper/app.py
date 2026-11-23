@@ -154,7 +154,7 @@ with make_tab:
                         progress=transcribe_progress,
                     )
                 except Exception as e:  # show any failure in the page, not a crash
-                    status.update(label="Something went wrong", state="error")
+                    status.update(label="Something went wrong", state="error", expanded=True)
                     st.error(str(e) or e.__class__.__name__)
                 else:
                     status.update(label="Done! Open the My clips tab.", state="complete")
