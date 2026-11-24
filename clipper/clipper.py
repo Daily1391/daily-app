@@ -39,6 +39,8 @@ def fetch(source: str) -> Path:
             raise ClipperError(f"File not found: {path}")
         return path
 
+    import fcntl
+
     import yt_dlp
 
     dl_dir = OUT_DIR / "source"
@@ -54,15 +56,32 @@ def fetch(source: str) -> Path:
             info = ydl.extract_info(source, download=False)
             if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
                 raise ClipperError("That stream is still live. Clip it after it ends and the replay is up.")
-            info = ydl.extract_info(source, download=True)
-            return Path(ydl.prepare_filename(info)).with_suffix(".mp4")
+            final = dl_dir / f"{info['id']}.mp4"
+            # One download per video at a time: a second click or a second tab waits for
+            # the first download instead of racing it, then reuses the finished file.
+            with open(dl_dir / f"{info['id']}.lock", "w") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                if final.exists() and final.stat().st_size > 0:
+                    return final  # already downloaded earlier
+                ydl.process_ie_result(info, download=True)
+            if final.exists():
+                return final
+            got = sorted(dl_dir.glob(f"{info['id']}.*"), key=lambda p: p.stat().st_size)
+            got = [g for g in got if g.suffix in (".mp4", ".mkv", ".webm")]
+            if got:
+                return got[-1]
+            raise ClipperError("The download finished but the video file is missing. Try again.")
     except yt_dlp.utils.DownloadError as e:
         msg = str(e)
-        hint = ""
         if "not a bot" in msg or "Sign in" in msg:
-            hint = " YouTube is blocking automated downloads right now. Download the video another way and upload the file instead."
-        elif "youtube" in source.lower():
-            hint = " If this keeps happening, close Clipper, run 'brew install deno' in Terminal, and try again."
+            hint = (" YouTube is blocking automated downloads right now. Download the video "
+                    "another way and upload the file instead.")
+        elif "Unable to rename" in msg:
+            hint = " Two downloads of the same video collided. Click Make clips again once and let it run."
+        elif any(k in msg for k in ("format is not available", "JavaScript", "JS runtime", "challenge")):
+            hint = " Close Clipper, run 'brew install deno' in Terminal, and try again."
+        else:
+            hint = ""
         raise ClipperError(f"Couldn't download that video.{hint}\n\nDetails: {msg}") from e
 
 
