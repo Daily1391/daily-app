@@ -782,8 +782,6 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
 def youtube_client():
-    import google_auth_httplib2
-    import httplib2
     from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
@@ -806,8 +804,18 @@ def youtube_client():
             creds = InstalledAppFlow.from_client_secrets_file(secret, SCOPES).run_local_server(port=0)
         token.write_text(creds.to_json())
     # 5-minute network timeout instead of the library's 60 seconds, for slow upload speeds
-    http = google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=300))
-    return build("youtube", "v3", http=http)
+    return build("youtube", "v3", http=authorized_http(creds))
+
+
+def authorized_http(creds):
+    """Google's own connection setup (it stops YouTube's "send the next piece" reply, code
+    308, being treated as a redirect), with a 5-minute timeout instead of 60 seconds."""
+    import google_auth_httplib2
+    from googleapiclient.http import build_http
+
+    base = build_http()
+    base.timeout = 300
+    return google_auth_httplib2.AuthorizedHttp(creds, http=base)
 
 
 UPLOAD_CHUNK = 4 * 1024 * 1024  # small pieces, so no single request takes long on slow Wi-Fi
